@@ -1,4 +1,5 @@
 import ee
+import streamlit as st
 
 
 # =========================================================
@@ -8,7 +9,6 @@ PROJECT_ID = "rising-method-478510-v9"
 ASSET_REGION = "projects/rising-method-478510-v9/assets/GEE_OT_Region"
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
 
-# Seuils de classification de la différence NDVI
 NEGATIVE_THRESHOLD = -0.05
 POSITIVE_THRESHOLD = 0.05
 
@@ -17,7 +17,22 @@ POSITIVE_THRESHOLD = 0.05
 # INITIALISATION EARTH ENGINE
 # =========================================================
 def init_ee():
-    ee.Initialize(project=PROJECT_ID)
+    """
+    Initialise Earth Engine.
+    - En ligne : utilise les secrets Streamlit + service account
+    - En local : utilise l'authentification déjà faite sur la machine
+    """
+    try:
+        service_account = st.secrets["gee_service_account"]
+        private_key = st.secrets["gee_private_key"]
+
+        credentials = ee.ServiceAccountCredentials(
+            service_account, key_data=private_key
+        )
+        ee.Initialize(credentials, project=PROJECT_ID)
+
+    except Exception:
+        ee.Initialize(project=PROJECT_ID)
 
 
 # =========================================================
@@ -33,11 +48,11 @@ def get_region():
 def mask_s2_clouds(image):
     scl = image.select("SCL")
     mask = (
-        scl.neq(3)   # ombre de nuage
-        .And(scl.neq(8))   # nuage moyen
-        .And(scl.neq(9))   # nuage fort
-        .And(scl.neq(10))  # cirrus
-        .And(scl.neq(11))  # neige/glace
+        scl.neq(3)
+        .And(scl.neq(8))
+        .And(scl.neq(9))
+        .And(scl.neq(10))
+        .And(scl.neq(11))
     )
     return image.updateMask(mask)
 
@@ -122,10 +137,6 @@ def get_ndvi_difference(period1_ndvi, period2_ndvi):
 
 # =========================================================
 # CLASSIFICATION DU CHANGEMENT
-# Classes :
-# 1 = diminution
-# 2 = stable
-# 3 = augmentation
 # =========================================================
 def classify_ndvi_difference(diff_image):
     classified = (
@@ -172,7 +183,6 @@ def get_image_stats(image, band_name="NDVI"):
 
 # =========================================================
 # SURFACES PAR CLASSE DE CHANGEMENT
-# Retourne les surfaces en hectares
 # =========================================================
 def get_change_surface_stats(classified_image):
     region = get_region()

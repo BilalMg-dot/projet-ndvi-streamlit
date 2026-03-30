@@ -1,10 +1,13 @@
 import ee
 import streamlit as st
 import os
+import geemap.foliumap as geemap # Plus léger pour le déploiement web
 
 # =========================================================
-# CONSTANTES
+# CONFIGURATION ET CONSTANTES
 # =========================================================
+st.set_page_config(page_title="GEE NDVI Monitor", layout="wide")
+
 PROJECT_ID = "rising-method-478510-v9"
 ASSET_REGION = "projects/rising-method-478510-v9/assets/GEE_OT_Region"
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
@@ -12,224 +15,121 @@ S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
 NEGATIVE_THRESHOLD = -0.05
 POSITIVE_THRESHOLD = 0.05
 
-
 # =========================================================
-# INITIALISATION EARTH ENGINE (Version corrigée)
+# INITIALISATION EARTH ENGINE
 # =========================================================
 def init_ee():
     """
-    Initialise Google Earth Engine avec le Service Account
-    - En local : utilise le fichier private-key.json
-    - En déploiement Streamlit : utilise les secrets
+    Initialise GEE sans chercher de fichier JSON physique en mode Cloud.
     """
     try:
-        # === 1. ESSAI EN LOCAL avec le fichier private-key.json ===
-        KEY_FILE = "private-key.json"
-        
-        if os.path.exists(KEY_FILE):
+        # PRIORITÉ 1 : Secrets Streamlit (Mode Déployé)
+        if "gee_service_account_json" in st.secrets:
+            creds = st.secrets["gee_service_account_json"]
             credentials = ee.ServiceAccountCredentials(
-                email="streamlit-ndvi-app@rising-method-478510-v9.iam.gserviceaccount.com",
-                key_file=KEY_FILE
+                email=creds["client_email"],
+                key_data=creds["private_key"]
             )
             ee.Initialize(credentials=credentials, project=PROJECT_ID)
-            st.success("✅ Earth Engine initialisé avec le fichier private-key.json (mode local)")
             return True
 
-        # === 2. ESSAI EN DÉPLOIEMENT (Streamlit Cloud) avec secrets ===
-        elif "gee_service_account_json" in st.secrets:
-            # Version avec tout le JSON dans les secrets (recommandée)
-            service_account_info = st.secrets["gee_service_account_json"]
-            credentials = ee.ServiceAccountCredentials.fromJSON(service_account_info)
-            ee.Initialize(credentials=credentials, project=PROJECT_ID)
-            st.success("✅ Earth Engine initialisé avec Streamlit Secrets")
+        # PRIORITÉ 2 : Fichier local (Mode Développement)
+        elif os.path.exists("private-key.json"):
+            # Ici, on utilise le chemin classique pour tes tests en local
+            ee.Initialize(
+                credentials=ee.ServiceAccountCredentials(
+                    email="streamlit-ndvi-app@rising-method-478510-v9.iam.gserviceaccount.com",
+                    key_file="private-key.json"
+                ),
+                project=PROJECT_ID
+            )
             return True
 
         else:
-            st.error("❌ Aucun fichier private-key.json trouvé et aucun secret configuré.")
-            st.info("Placez private-key.json dans le dossier du projet pour le mode local.")
+            st.error("❌ Erreur : Aucune méthode d'authentification trouvée (Secrets ou JSON).")
             return False
-
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'initialisation de Earth Engine :\n{str(e)}")
+        st.error(f"❌ Échec de la connexion à Google Earth Engine : {e}")
         return False
 
+# =========================================================
+# FONCTIONS DE TRAITEMENT (Optimisées)
+# =========================================================
 
-# =========================================================
-# LES AUTRES FONCTIONS (inchangées)
-# =========================================================
 def get_region():
     return ee.FeatureCollection(ASSET_REGION)
 
-
 def mask_s2_clouds(image):
     scl = image.select("SCL")
-    mask = (
-        scl.neq(3)
-        .And(scl.neq(8))
-        .And(scl.neq(9))
-        .And(scl.neq(10))
-        .And(scl.neq(11))
-    )
+    mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10)).And(scl.neq(11))
     return image.updateMask(mask)
 
-
-def get_month_start_end(year: int, month: int):
+def get_monthly_ndvi(year, month, cloud_threshold=15):
+    region = get_region()
     start = ee.Date.fromYMD(year, month, 1)
     end = start.advance(1, "month")
-    return start, end
-
-
-def get_monthly_collection(year: int, month: int, cloud_threshold: int = 15):
-    region = get_region()
-    start, end = get_month_start_end(year, month)
-
-    collection = (
-        ee.ImageCollection(S2_COLLECTION)
-        .filterBounds(region)
-        .filterDate(start, end)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_threshold))
-        .map(mask_s2_clouds)
-    )
-    return collection
-
-
-def get_monthly_ndvi(year: int, month: int, cloud_threshold: int = 15):
-    region = get_region()
-    collection = get_monthly_collection(year, month, cloud_threshold)
-
+    
+    collection = (ee.ImageCollection(S2_COLLECTION)
+                  .filterBounds(region)
+                  .filterDate(start, end)
+                  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_threshold))
+                  .map(mask_s2_clouds))
+    
     image = collection.median().clip(region)
     ndvi = image.normalizedDifference(["B8", "B4"]).rename("NDVI")
-
-    start, _ = get_month_start_end(year, month)
-
+    
     return ndvi.set({
-        "year": year,
-        "month": month,
+        "year": year, 
+        "month": month, 
         "system:time_start": start.millis(),
         "image_count": collection.size()
     })
 
-
-def get_period_ndvi(year: int, months: list[int], cloud_threshold: int = 15):
-    images = [get_monthly_ndvi(year, month, cloud_threshold) for month in months]
-    image_collection = ee.ImageCollection(images)
-    ndvi_period = image_collection.mean().rename("NDVI")
-    return ndvi_period
-
-
-def get_period_image_count(year: int, months: list[int], cloud_threshold: int = 15):
-    total = 0
-    for month in months:
-        collection = get_monthly_collection(year, month, cloud_threshold)
-        total += collection.size().getInfo()
-    return total
-
-
-def get_ndvi_difference(period1_ndvi, period2_ndvi):
-    common_mask = period1_ndvi.mask().And(period2_ndvi.mask())
-    p1 = period1_ndvi.updateMask(common_mask)
-    p2 = period2_ndvi.updateMask(common_mask)
-    diff = p2.subtract(p1).rename("NDVI_diff")
-    return diff
-
-
-def classify_ndvi_difference(diff_image):
-    classified = (
-        ee.Image(2)
-        .where(diff_image.lt(NEGATIVE_THRESHOLD), 1)
-        .where(diff_image.gt(POSITIVE_THRESHOLD), 3)
-        .updateMask(diff_image.mask())
-        .rename("Change_Class")
-    )
-    return classified
-
-
-def get_image_stats(image, band_name="NDVI"):
-    region = get_region()
-
-    stats = image.reduceRegion(
-        reducer=(
-            ee.Reducer.mean()
-            .combine(reducer2=ee.Reducer.stdDev(), sharedInputs=True)
-            .combine(reducer2=ee.Reducer.percentile([25, 75]), sharedInputs=True)
-            .combine(reducer2=ee.Reducer.min(), sharedInputs=True)
-            .combine(reducer2=ee.Reducer.max(), sharedInputs=True)
-        ),
-        geometry=region.geometry(),
-        scale=10,
-        maxPixels=1e13,
-        bestEffort=True
-    )
-
-    info = stats.getInfo()
-    return {
-        "mean": info.get(f"{band_name}_mean"),
-        "stdDev": info.get(f"{band_name}_stdDev"),
-        "p25": info.get(f"{band_name}_p25"),
-        "p75": info.get(f"{band_name}_p75"),
-        "min": info.get(f"{band_name}_min"),
-        "max": info.get(f"{band_name}_max"),
-    }
-
-
-def get_change_surface_stats(classified_image):
-    region = get_region()
-    pixel_area_ha = ee.Image.pixelArea().divide(10000)
-
-    diminution = pixel_area_ha.updateMask(classified_image.eq(1)).rename("area")
-    stable = pixel_area_ha.updateMask(classified_image.eq(2)).rename("area")
-    augmentation = pixel_area_ha.updateMask(classified_image.eq(3)).rename("area")
-
-    diminution_stats = diminution.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region.geometry(),
-        scale=10,
-        maxPixels=1e13,
-        bestEffort=True
-    )
-
-    stable_stats = stable.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region.geometry(),
-        scale=10,
-        maxPixels=1e13,
-        bestEffort=True
-    )
-
-    augmentation_stats = augmentation.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region.geometry(),
-        scale=10,
-        maxPixels=1e13,
-        bestEffort=True
-    )
-
-    return {
-        "diminution_ha": diminution_stats.get("area").getInfo() or 0.0,
-        "stable_ha": stable_stats.get("area").getInfo() or 0.0,
-        "augmentation_ha": augmentation_stats.get("area").getInfo() or 0.0,
-    }
-
-
 def get_ndvi_vis_params():
     return {
-        "min": 0,
-        "max": 1,
+        "min": 0, "max": 0.8, 
         "palette": ["#8c510a", "#d8b365", "#f6e8c3", "#c7eae5", "#5ab4ac", "#01665e"]
     }
 
+# =========================================================
+# INTERFACE UTILISATEUR (UI)
+# =========================================================
 
-def get_diff_vis_params():
-    return {
-        "min": -0.4,
-        "max": 0.4,
-        "palette": ["#b2182b", "#ef8a62", "#fddbc7", "#f7f7f7", "#d9f0d3", "#7fbf7b", "#1a9850"]
-    }
+def main():
+    st.title("🛰️ Analyse de la Végétation (NDVI)")
+    
+    if not init_ee():
+        st.stop() # Arrête l'application si l'auth échoue
 
+    # --- Barre latérale ---
+    st.sidebar.header("Paramètres")
+    year = st.sidebar.slider("Année", 2015, 2025, 2023)
+    month = st.sidebar.slider("Mois", 1, 12, 6)
+    cloud_pct = st.sidebar.number_input("Seuil de nuages (%)", 0, 100, 15)
 
-def get_classified_change_vis_params():
-    return {
-        "min": 1,
-        "max": 3,
-        "palette": ["#d73027", "#f0f0f0", "#1a9850"]
-    }
+    # --- Calculs ---
+    with st.spinner("Calcul du NDVI en cours..."):
+        try:
+            region_fc = get_region()
+            ndvi_img = get_monthly_ndvi(year, month, cloud_pct)
+            
+            # Vérification si des images existent
+            count = ndvi_img.get("image_count").getInfo()
+            
+            if count == 0:
+                st.warning(f"Aucune image trouvée pour {month}/{year} avec ce seuil de nuages.")
+            else:
+                st.success(f"Analyse basée sur {count} images Sentinel-2.")
+                
+                # --- Affichage de la carte ---
+                m = geemap.Map()
+                m.centerObject(region_fc, 10)
+                m.addLayer(ndvi_img, get_ndvi_vis_params(), f"NDVI {month}/{year}")
+                m.addLayer(region_fc, {"color": "red"}, "Zone d'étude", False)
+                m.to_streamlit(height=600)
+                
+        except Exception as e:
+            st.error(f"Erreur lors du traitement : {e}")
+
+if __name__ == "__main__":
+    main()

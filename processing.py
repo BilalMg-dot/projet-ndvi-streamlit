@@ -18,22 +18,29 @@ POSITIVE_THRESHOLD = 0.05
 # =========================================================
 def init_ee():
     """
-    Initialise Earth Engine.
-    - En ligne : utilise les secrets Streamlit + service account
-    - En local : utilise l'authentification déjà faite sur la machine
+    Initialise Earth Engine en utilisant les secrets Streamlit.
     """
-    try:
-        service_account = st.secrets["gee_service_account"]
-        private_key = st.secrets["gee_private_key"]
+    # Vérification de la présence des clés dans les secrets
+    if "gee_service_account" in st.secrets and "gee_private_key" in st.secrets:
+        try:
+            service_account = st.secrets["gee_service_account"]
+            private_key = st.secrets["gee_private_key"]
 
-        credentials = ee.ServiceAccountCredentials(
-            service_account, key_data=private_key
-        )
-        ee.Initialize(credentials, project=PROJECT_ID)
-
-    except Exception:
-        ee.Initialize(project=PROJECT_ID)
-
+            # Initialisation avec Service Account
+            credentials = ee.ServiceAccountCredentials(
+                service_account, key_data=private_key
+            )
+            ee.Initialize(credentials, project=PROJECT_ID)
+            return True
+        except Exception as e:
+            # Si les secrets sont là mais invalides (ex: mauvaise clé)
+            st.error(f"❌ Erreur d'authentification GEE : {e}")
+            st.stop()
+    else:
+        # Si les secrets sont carrément absents du tableau de bord Streamlit
+        st.error("❌ Secrets 'gee_service_account' ou 'gee_private_key' manquants dans Streamlit Cloud.")
+        st.info("Vérifiez la section 'Settings > Secrets' de votre application.")
+        st.stop()
 
 # =========================================================
 # CHARGEMENT DE LA REGION

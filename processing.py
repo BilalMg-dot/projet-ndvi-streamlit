@@ -1,6 +1,7 @@
 import ee
 import streamlit as st
 import os
+import json
 
 # =========================================================
 # CONSTANTES
@@ -23,7 +24,9 @@ def init_ee():
     - En déploiement Streamlit : utilise les secrets
     """
     try:
-        # MODE LOCAL
+        # ==========================================
+        # MODE LOCAL : private-key.json
+        # ==========================================
         key_file = "private-key.json"
 
         if os.path.exists(key_file):
@@ -35,11 +38,16 @@ def init_ee():
             st.success("✅ Earth Engine initialisé avec le fichier private-key.json (mode local)")
             return True
 
-        # MODE STREAMLIT CLOUD
+        # ==========================================
+        # MODE STREAMLIT CLOUD : JSON complet dans Secrets
+        # ==========================================
         elif "gee_service_account_json" in st.secrets:
-            service_account_info = st.secrets["gee_service_account_json"]
+            service_account_info = json.loads(st.secrets["gee_service_account_json"])
 
-            credentials = ee.ServiceAccountCredentials.fromJSON(service_account_info)
+            credentials = ee.ServiceAccountCredentials(
+                email=service_account_info["client_email"],
+                key_data=service_account_info["private_key"]
+            )
             ee.Initialize(credentials=credentials, project=PROJECT_ID)
             st.success("✅ Earth Engine initialisé avec Streamlit Secrets")
             return True
@@ -50,7 +58,7 @@ def init_ee():
             return False
 
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'initialisation de Earth Engine :\n{str(e)}")
+        st.error(f"❌ Erreur lors de l'initialisation de Earth Engine : {str(e)}")
         return False
 
 
@@ -156,9 +164,6 @@ def get_ndvi_difference(period1_ndvi, period2_ndvi):
 
 # =========================================================
 # CLASSIFICATION DU CHANGEMENT
-# 1 = diminution
-# 2 = stable
-# 3 = augmentation
 # =========================================================
 def classify_ndvi_difference(diff_image):
     classified = (

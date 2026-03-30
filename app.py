@@ -125,8 +125,9 @@ st.markdown(
 # INITIALISATION GEE
 # =========================================================
 try:
-    init_ee()
-    st.success("Connexion à Google Earth Engine réussie.")
+    ee_ok = init_ee()
+    if not ee_ok:
+        st.stop()
 except Exception as e:
     st.error("Erreur lors de l'initialisation de Google Earth Engine.")
     st.exception(e)

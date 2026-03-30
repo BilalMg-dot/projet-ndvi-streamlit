@@ -1,6 +1,6 @@
 import ee
 import streamlit as st
-
+import os
 
 # =========================================================
 # CONSTANTES
@@ -18,21 +18,40 @@ POSITIVE_THRESHOLD = 0.05
 # =========================================================
 def init_ee():
     """
-    Initialise Earth Engine.
-    - En ligne : utilise les secrets Streamlit + service account
-    - En local : utilise l'authentification déjà faite sur la machine
+    Initialise Google Earth Engine avec le Service Account
+    - En local : utilise le fichier private-key.json
+    - En déploiement Streamlit : utilise les secrets
     """
     try:
-        service_account = st.secrets["gee_service_account"]
-        private_key = st.secrets["gee_private_key"]
+        # MODE LOCAL
+        key_file = "private-key.json"
 
-        credentials = ee.ServiceAccountCredentials(
-            service_account, key_data=private_key
-        )
-        ee.Initialize(credentials, project=PROJECT_ID)
+        if os.path.exists(key_file):
+            credentials = ee.ServiceAccountCredentials(
+                email="streamlit-ndvi-app@rising-method-478510-v9.iam.gserviceaccount.com",
+                key_file=key_file
+            )
+            ee.Initialize(credentials=credentials, project=PROJECT_ID)
+            st.success("✅ Earth Engine initialisé avec le fichier private-key.json (mode local)")
+            return True
 
-    except Exception:
-        ee.Initialize(project=PROJECT_ID)
+        # MODE STREAMLIT CLOUD
+        elif "gee_service_account_json" in st.secrets:
+            service_account_info = st.secrets["gee_service_account_json"]
+
+            credentials = ee.ServiceAccountCredentials.fromJSON(service_account_info)
+            ee.Initialize(credentials=credentials, project=PROJECT_ID)
+            st.success("✅ Earth Engine initialisé avec Streamlit Secrets")
+            return True
+
+        else:
+            st.error("❌ Aucun fichier private-key.json trouvé et aucun secret configuré.")
+            st.info("Ajoute private-key.json en local ou configure les secrets sur Streamlit Cloud.")
+            return False
+
+    except Exception as e:
+        st.error(f"❌ Erreur lors de l'initialisation de Earth Engine :\n{str(e)}")
+        return False
 
 
 # =========================================================
@@ -104,7 +123,7 @@ def get_monthly_ndvi(year: int, month: int, cloud_threshold: int = 15):
 
 
 # =========================================================
-# CALCUL NDVI D'UNE PÉRIODE (PLUSIEURS MOIS)
+# CALCUL NDVI D'UNE PÉRIODE
 # =========================================================
 def get_period_ndvi(year: int, months: list[int], cloud_threshold: int = 15):
     images = [get_monthly_ndvi(year, month, cloud_threshold) for month in months]
@@ -137,6 +156,9 @@ def get_ndvi_difference(period1_ndvi, period2_ndvi):
 
 # =========================================================
 # CLASSIFICATION DU CHANGEMENT
+# 1 = diminution
+# 2 = stable
+# 3 = augmentation
 # =========================================================
 def classify_ndvi_difference(diff_image):
     classified = (

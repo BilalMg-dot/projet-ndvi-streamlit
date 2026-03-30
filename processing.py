@@ -1,7 +1,6 @@
 import ee
 import streamlit as st
 import os
-import json
 
 # =========================================================
 # CONSTANTES
@@ -15,7 +14,7 @@ POSITIVE_THRESHOLD = 0.05
 
 
 # =========================================================
-# INITIALISATION EARTH ENGINE
+# INITIALISATION EARTH ENGINE (Version corrigée)
 # =========================================================
 def init_ee():
     """
@@ -24,54 +23,44 @@ def init_ee():
     - En déploiement Streamlit : utilise les secrets
     """
     try:
-        # ==========================================
-        # MODE LOCAL : private-key.json
-        # ==========================================
-        key_file = "private-key.json"
-
-        if os.path.exists(key_file):
+        # === 1. ESSAI EN LOCAL avec le fichier private-key.json ===
+        KEY_FILE = "private-key.json"
+        
+        if os.path.exists(KEY_FILE):
             credentials = ee.ServiceAccountCredentials(
                 email="streamlit-ndvi-app@rising-method-478510-v9.iam.gserviceaccount.com",
-                key_file=key_file
+                key_file=KEY_FILE
             )
             ee.Initialize(credentials=credentials, project=PROJECT_ID)
             st.success("✅ Earth Engine initialisé avec le fichier private-key.json (mode local)")
             return True
 
-        # ==========================================
-        # MODE STREAMLIT CLOUD : JSON complet dans Secrets
-        # ==========================================
+        # === 2. ESSAI EN DÉPLOIEMENT (Streamlit Cloud) avec secrets ===
         elif "gee_service_account_json" in st.secrets:
-            service_account_info = json.loads(st.secrets["gee_service_account_json"])
-
-            credentials = ee.ServiceAccountCredentials(
-                email=service_account_info["client_email"],
-                key_data=service_account_info["private_key"]
-            )
+            # Version avec tout le JSON dans les secrets (recommandée)
+            service_account_info = st.secrets["gee_service_account_json"]
+            credentials = ee.ServiceAccountCredentials.fromJSON(service_account_info)
             ee.Initialize(credentials=credentials, project=PROJECT_ID)
             st.success("✅ Earth Engine initialisé avec Streamlit Secrets")
             return True
 
         else:
             st.error("❌ Aucun fichier private-key.json trouvé et aucun secret configuré.")
-            st.info("Ajoute private-key.json en local ou configure les secrets sur Streamlit Cloud.")
+            st.info("Placez private-key.json dans le dossier du projet pour le mode local.")
             return False
 
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'initialisation de Earth Engine : {str(e)}")
+        st.error(f"❌ Erreur lors de l'initialisation de Earth Engine :\n{str(e)}")
         return False
 
 
 # =========================================================
-# CHARGEMENT DE LA REGION
+# LES AUTRES FONCTIONS (inchangées)
 # =========================================================
 def get_region():
     return ee.FeatureCollection(ASSET_REGION)
 
 
-# =========================================================
-# MASQUE SIMPLE DES NUAGES
-# =========================================================
 def mask_s2_clouds(image):
     scl = image.select("SCL")
     mask = (
@@ -84,18 +73,12 @@ def mask_s2_clouds(image):
     return image.updateMask(mask)
 
 
-# =========================================================
-# DATES D'UN MOIS
-# =========================================================
 def get_month_start_end(year: int, month: int):
     start = ee.Date.fromYMD(year, month, 1)
     end = start.advance(1, "month")
     return start, end
 
 
-# =========================================================
-# COLLECTION SENTINEL-2 D'UN MOIS
-# =========================================================
 def get_monthly_collection(year: int, month: int, cloud_threshold: int = 15):
     region = get_region()
     start, end = get_month_start_end(year, month)
@@ -110,9 +93,6 @@ def get_monthly_collection(year: int, month: int, cloud_threshold: int = 15):
     return collection
 
 
-# =========================================================
-# CALCUL NDVI MENSUEL
-# =========================================================
 def get_monthly_ndvi(year: int, month: int, cloud_threshold: int = 15):
     region = get_region()
     collection = get_monthly_collection(year, month, cloud_threshold)
@@ -130,9 +110,6 @@ def get_monthly_ndvi(year: int, month: int, cloud_threshold: int = 15):
     })
 
 
-# =========================================================
-# CALCUL NDVI D'UNE PÉRIODE
-# =========================================================
 def get_period_ndvi(year: int, months: list[int], cloud_threshold: int = 15):
     images = [get_monthly_ndvi(year, month, cloud_threshold) for month in months]
     image_collection = ee.ImageCollection(images)
@@ -140,9 +117,6 @@ def get_period_ndvi(year: int, months: list[int], cloud_threshold: int = 15):
     return ndvi_period
 
 
-# =========================================================
-# NOMBRE TOTAL D'IMAGES D'UNE PÉRIODE
-# =========================================================
 def get_period_image_count(year: int, months: list[int], cloud_threshold: int = 15):
     total = 0
     for month in months:
@@ -151,9 +125,6 @@ def get_period_image_count(year: int, months: list[int], cloud_threshold: int = 
     return total
 
 
-# =========================================================
-# DIFFÉRENCE ENTRE DEUX PÉRIODES
-# =========================================================
 def get_ndvi_difference(period1_ndvi, period2_ndvi):
     common_mask = period1_ndvi.mask().And(period2_ndvi.mask())
     p1 = period1_ndvi.updateMask(common_mask)
@@ -162,9 +133,6 @@ def get_ndvi_difference(period1_ndvi, period2_ndvi):
     return diff
 
 
-# =========================================================
-# CLASSIFICATION DU CHANGEMENT
-# =========================================================
 def classify_ndvi_difference(diff_image):
     classified = (
         ee.Image(2)
@@ -176,9 +144,6 @@ def classify_ndvi_difference(diff_image):
     return classified
 
 
-# =========================================================
-# STATISTIQUES D'UNE IMAGE
-# =========================================================
 def get_image_stats(image, band_name="NDVI"):
     region = get_region()
 
@@ -197,7 +162,6 @@ def get_image_stats(image, band_name="NDVI"):
     )
 
     info = stats.getInfo()
-
     return {
         "mean": info.get(f"{band_name}_mean"),
         "stdDev": info.get(f"{band_name}_stdDev"),
@@ -208,9 +172,6 @@ def get_image_stats(image, band_name="NDVI"):
     }
 
 
-# =========================================================
-# SURFACES PAR CLASSE DE CHANGEMENT
-# =========================================================
 def get_change_surface_stats(classified_image):
     region = get_region()
     pixel_area_ha = ee.Image.pixelArea().divide(10000)
@@ -250,9 +211,6 @@ def get_change_surface_stats(classified_image):
     }
 
 
-# =========================================================
-# PARAMÈTRES D'AFFICHAGE
-# =========================================================
 def get_ndvi_vis_params():
     return {
         "min": 0,

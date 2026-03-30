@@ -125,9 +125,8 @@ st.markdown(
 # INITIALISATION GEE
 # =========================================================
 try:
-    ee_ok = init_ee()
-    if not ee_ok:
-        st.error("La connexion GEE a échoué. Vérifiez vos secrets Streamlit.")
+    init_ee()
+    st.success("Connexion à Google Earth Engine réussie.")
 except Exception as e:
     st.error("Erreur lors de l'initialisation de Google Earth Engine.")
     st.exception(e)

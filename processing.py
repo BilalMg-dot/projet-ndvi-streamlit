@@ -18,6 +18,11 @@ POSITIVE_THRESHOLD = 0.05
 # INITIALISATION EARTH ENGINE
 # =========================================================
 def init_ee():
+    """
+    Initialise Google Earth Engine avec le Service Account
+    - En local : utilise le fichier private-key.json
+    - En déploiement Streamlit : utilise les secrets
+    """
     try:
         # ==========================================
         # MODE LOCAL : private-key.json
@@ -30,22 +35,26 @@ def init_ee():
                 key_file=key_file
             )
             ee.Initialize(credentials=credentials, project=PROJECT_ID)
+            st.success("✅ Earth Engine initialisé avec le fichier private-key.json (mode local)")
             return True
 
         # ==========================================
-        # MODE STREAMLIT CLOUD : secrets TOML
+        # MODE STREAMLIT CLOUD : JSON complet dans Secrets
         # ==========================================
         elif "gee_service_account_json" in st.secrets:
-            info = dict(st.secrets["gee_service_account_json"])  # ✅ pas de json.loads()
+            service_account_info = json.loads(st.secrets["gee_service_account_json"])
+
             credentials = ee.ServiceAccountCredentials(
-                email=info["client_email"],
-                key_data=json.dumps(info)  # ✅ on convertit le dict en string JSON
+                email=service_account_info["client_email"],
+                key_data=service_account_info["private_key"]
             )
             ee.Initialize(credentials=credentials, project=PROJECT_ID)
+            st.success("✅ Earth Engine initialisé avec Streamlit Secrets")
             return True
 
         else:
             st.error("❌ Aucun fichier private-key.json trouvé et aucun secret configuré.")
+            st.info("Ajoute private-key.json en local ou configure les secrets sur Streamlit Cloud.")
             return False
 
     except Exception as e:

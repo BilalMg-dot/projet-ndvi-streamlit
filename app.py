@@ -1,20 +1,22 @@
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import geemap.foliumap as geemap
+from datetime import date, timedelta
 
 from processing import (
     init_ee,
     get_region,
     build_parcel_from_text,
-    get_monthly_ndvi,
-    get_monthly_ndmi,
+    get_available_dates,
+    find_closest_date,
+    get_image_for_exact_date,
+    get_ndvi,
+    get_ndmi,
     classify_ndvi_vigor,
     classify_ndmi_hydric,
     build_priority_map,
     get_image_stats,
-    get_month_image_count,
     get_class_surface_stats,
     get_ndvi_vis_params,
     get_ndmi_vis_params,
@@ -27,7 +29,7 @@ from processing import (
 # CONFIGURATION PAGE
 # =========================================================
 st.set_page_config(
-    page_title="Application agricole - Parcelle",
+    page_title="Suivi agricole de parcelle",
     page_icon="🌿",
     layout="wide",
 )
@@ -109,18 +111,16 @@ st.markdown(
 # =========================================================
 # TITRE
 # =========================================================
-st.markdown('<div class="main-title">🌿 Application de diagnostic agricole de parcelle</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🌿 Application de suivi agricole de parcelle</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">Analyse de la vigueur végétale, de l’état hydrique et des zones prioritaires sur une parcelle agricole.</div>',
+    '<div class="sub-title">Analyse de la vigueur végétale, de l’état hydrique et des zones prioritaires sur une parcelle agricole à partir de l’image disponible la plus proche.</div>',
     unsafe_allow_html=True
 )
 
 st.markdown(
     """
     <div class="zone-box">
-    <b>Objectif :</b> aider l’agriculteur à analyser sa parcelle à distance,
-    repérer les zones à faible végétation, examiner un stress hydrique potentiel
-    et identifier les secteurs prioritaires à surveiller.
+    <b>Objectif :</b> aider l’agriculteur à suivre sa parcelle à distance, à partir de l’image Sentinel-2 disponible la plus proche de la date souhaitée, afin d’évaluer l’état de la végétation, l’état hydrique et les zones à surveiller.
     </div>
     """,
     unsafe_allow_html=True
@@ -139,24 +139,6 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-# MOIS DISPONIBLES
-# =========================================================
-month_dict = {
-    "Janvier": 1,
-    "Février": 2,
-    "Mars": 3,
-    "Avril": 4,
-    "Mai": 5,
-    "Juin": 6,
-    "Juillet": 7,
-    "Août": 8,
-    "Septembre": 9,
-    "Octobre": 10,
-    "Novembre": 11,
-    "Décembre": 12
-}
-
-# =========================================================
 # SIDEBAR
 # =========================================================
 st.sidebar.markdown('<div class="sidebar-title">Paramètres de l’analyse</div>', unsafe_allow_html=True)
@@ -166,18 +148,31 @@ zone_mode = st.sidebar.radio(
     ["Utiliser la région par défaut", "Définir ma parcelle par coordonnées"]
 )
 
-year_selected = st.sidebar.selectbox("Année", [2022, 2023, 2024, 2025], index=3)
-month_label = st.sidebar.selectbox("Mois", list(month_dict.keys()), index=3)
-cloud_threshold = st.sidebar.slider("Seuil maximal de nuages (%)", 0, 50, 15)
-
 parcel_text = ""
 if zone_mode == "Définir ma parcelle par coordonnées":
     parcel_text = st.sidebar.text_area(
-        "Coordonnées du polygone (latitude,longitude sur chaque ligne)",
+        "Coordonnées de la parcelle (latitude,longitude sur chaque ligne)",
         height=180,
         placeholder="32.5021,-6.4132\n32.5028,-6.4011\n32.4950,-6.3998\n32.4942,-6.4110"
     )
-    st.sidebar.caption("Format attendu : une ligne par point, sous la forme latitude,longitude")
+    st.sidebar.caption("Format : une ligne par point, sous la forme latitude,longitude")
+
+cloud_threshold = st.sidebar.slider("Seuil maximal de nuages (%)", 0, 80, 20)
+
+# Date demandée par l'utilisateur
+desired_date = st.sidebar.date_input(
+    "Date souhaitée",
+    value=date.today() - timedelta(days=10)
+)
+
+# Fenêtre de recherche des dates disponibles
+days_back = st.sidebar.slider(
+    "Nombre de jours récents à explorer",
+    min_value=15,
+    max_value=180,
+    value=90,
+    step=5
+)
 
 run = st.sidebar.button("🚀 Analyser la parcelle", use_container_width=True)
 
@@ -189,10 +184,10 @@ if not run:
         """
         <div class="highlight-box">
         Cette application permet à l’utilisateur :
-        <br>• de choisir une parcelle,
-        <br>• de visualiser la vigueur végétale,
-        <br>• d’examiner l’état hydrique,
-        <br>• et d’identifier les zones prioritaires d’intervention.
+        <br>• de choisir sa parcelle,
+        <br>• de demander une date d’analyse,
+        <br>• d’utiliser automatiquement l’image disponible la plus proche,
+        <br>• puis d’obtenir un diagnostic agricole simplifié.
         </div>
         """,
         unsafe_allow_html=True
@@ -206,7 +201,7 @@ if not run:
         st.markdown(
             """
             <div class="custom-card">
-                <b>1. Définir la zone</b><br>
+                <b>1. Définir la parcelle</b><br>
                 Utilise la région par défaut ou saisis les coordonnées de ta parcelle.
             </div>
             """,
@@ -217,8 +212,8 @@ if not run:
         st.markdown(
             """
             <div class="custom-card">
-                <b>2. Choisir la période</b><br>
-                Sélectionne l’année, le mois et le seuil de nuages.
+                <b>2. Choisir une date</b><br>
+                L’application recherche automatiquement l’image disponible la plus proche.
             </div>
             """,
             unsafe_allow_html=True
@@ -229,7 +224,7 @@ if not run:
             """
             <div class="custom-card">
                 <b>3. Lire le diagnostic</b><br>
-                Consulte la vigueur végétale, l’état hydrique et les zones prioritaires.
+                Consulte les cartes, les statistiques et les zones prioritaires d’intervention.
             </div>
             """,
             unsafe_allow_html=True
@@ -258,28 +253,61 @@ try:
         region = build_parcel_from_text(parcel_text)
         zone_label = "Parcelle utilisateur"
 
-    month_selected = month_dict[month_label]
+    # -----------------------------------------------------
+    # 2. Recherche des dates disponibles sur les derniers jours
+    # -----------------------------------------------------
+    desired_date_str = desired_date.strftime("%Y-%m-%d")
+    start_search_date = (desired_date - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    end_search_date = date.today().strftime("%Y-%m-%d")
+
+    available_dates = get_available_dates(
+        region=region,
+        start_date=start_search_date,
+        end_date=end_search_date,
+        cloud_threshold=cloud_threshold
+    )
+
+    if not available_dates:
+        st.warning("Aucune image disponible pour cette parcelle sur la période récente choisie.")
+        st.stop()
+
+    closest_date = find_closest_date(desired_date_str, available_dates)
+
+    if closest_date is None:
+        st.warning("Impossible de trouver une date proche.")
+        st.stop()
 
     # -----------------------------------------------------
-    # 2. Calcul des indices
+    # 3. Chargement de l'image du jour retenu
     # -----------------------------------------------------
-    ndvi_image = get_monthly_ndvi(year_selected, month_selected, cloud_threshold, region)
-    ndmi_image = get_monthly_ndmi(year_selected, month_selected, cloud_threshold, region)
+    image = get_image_for_exact_date(
+        region=region,
+        selected_date=closest_date,
+        cloud_threshold=cloud_threshold
+    )
+
+    if image is None:
+        st.warning("Impossible de charger l’image retenue.")
+        st.stop()
 
     # -----------------------------------------------------
-    # 3. Classification thématique
+    # 4. Calcul des indices
+    # -----------------------------------------------------
+    ndvi_image = get_ndvi(image)
+    ndmi_image = get_ndmi(image)
+
+    # -----------------------------------------------------
+    # 5. Classification
     # -----------------------------------------------------
     vigor_class = classify_ndvi_vigor(ndvi_image)
     hydric_class = classify_ndmi_hydric(ndmi_image)
     priority_map = build_priority_map(vigor_class, hydric_class)
 
     # -----------------------------------------------------
-    # 4. Statistiques descriptives
+    # 6. Statistiques
     # -----------------------------------------------------
     ndvi_stats = get_image_stats(ndvi_image, band_name="NDVI", region=region)
     ndmi_stats = get_image_stats(ndmi_image, band_name="NDMI", region=region)
-
-    image_count = get_month_image_count(year_selected, month_selected, cloud_threshold, region)
 
     vigor_surfaces = get_class_surface_stats(
         vigor_class,
@@ -311,156 +339,65 @@ try:
         region=region
     )
 
-    st.success("Analyse de la parcelle réalisée avec succès.")
+    st.success("Analyse réalisée avec succès.")
 
     # =====================================================
-    # RÉSUMÉ
+    # RÉSUMÉ RAPIDE
     # =====================================================
-    st.markdown('<div class="section-title">Résumé du diagnostic</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Résumé rapide</div>', unsafe_allow_html=True)
 
-    r1, r2, r3, r4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
 
-    with r1:
+    with c1:
+        st.metric("Date demandée", desired_date.strftime("%d/%m/%Y"))
+
+    with c2:
+        st.metric("Image utilisée", datetime.strptime(closest_date, "%Y-%m-%d").strftime("%d/%m/%Y"))
+
+    with c3:
         st.metric("NDVI moyen", f"{ndvi_stats['mean']:.3f}" if ndvi_stats["mean"] is not None else "NA")
 
-    with r2:
-        st.metric("NDMI moyen", f"{ndmi_stats['mean']:.3f}" if ndmi_stats["mean"] is not None else "NA")
-
-    with r3:
-        st.metric("Images utilisées", image_count)
-
-    with r4:
+    with c4:
         st.metric("Zone prioritaire (ha)", f"{priority_surfaces['zone_prioritaire_ha']:.2f}")
+
+    # =====================================================
+    # DATES DISPONIBLES
+    # =====================================================
+    st.markdown('<div class="section-title">Dates disponibles récentes</div>', unsafe_allow_html=True)
+
+    df_dates = pd.DataFrame({"Dates disponibles": available_dates})
+    df_dates["Date formatée"] = pd.to_datetime(df_dates["Dates disponibles"]).dt.strftime("%d/%m/%Y")
+    df_dates["Utilisée"] = df_dates["Dates disponibles"].apply(lambda x: "Oui" if x == closest_date else "")
+
+    st.dataframe(
+        df_dates[["Date formatée", "Utilisée"]],
+        use_container_width=True
+    )
 
     # =====================================================
     # ONGLETS
     # =====================================================
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🗺️ Cartes",
         "📊 Statistiques",
         "📈 Graphiques",
-        "🗺️ Cartes",
         "🧠 Diagnostic",
         "⬇️ Export"
     ])
 
     # =====================================================
-    # ONGLET 1 - STATISTIQUES
+    # ONGLET 1 - CARTES
     # =====================================================
     with tab1:
-        st.markdown('<div class="section-title">Statistiques globales</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Cartes principales</div>', unsafe_allow_html=True)
 
-        df_stats = pd.DataFrame([
-            {
-                "Indicateur": "NDVI",
-                "Moyenne": ndvi_stats["mean"],
-                "P25": ndvi_stats["p25"],
-                "P75": ndvi_stats["p75"],
-                "Écart-type": ndvi_stats["stdDev"],
-                "Min": ndvi_stats["min"],
-                "Max": ndvi_stats["max"],
-            },
-            {
-                "Indicateur": "NDMI",
-                "Moyenne": ndmi_stats["mean"],
-                "P25": ndmi_stats["p25"],
-                "P75": ndmi_stats["p75"],
-                "Écart-type": ndmi_stats["stdDev"],
-                "Min": ndmi_stats["min"],
-                "Max": ndmi_stats["max"],
-            },
-        ])
-
-        st.dataframe(df_stats.round(3), use_container_width=True)
-
-        st.markdown('<div class="section-title">Surfaces par classe (hectares)</div>', unsafe_allow_html=True)
-
-        df_surfaces = pd.DataFrame([
-            {"Type": "Végétation faible", "Surface (ha)": vigor_surfaces["vegetation_faible_ha"]},
-            {"Type": "Végétation moyenne", "Surface (ha)": vigor_surfaces["vegetation_moyenne_ha"]},
-            {"Type": "Végétation forte", "Surface (ha)": vigor_surfaces["vegetation_forte_ha"]},
-            {"Type": "Hydrique faible", "Surface (ha)": hydric_surfaces["hydrique_faible_ha"]},
-            {"Type": "Hydrique moyen", "Surface (ha)": hydric_surfaces["hydrique_moyen_ha"]},
-            {"Type": "Hydrique bon", "Surface (ha)": hydric_surfaces["hydrique_bon_ha"]},
-            {"Type": "Zone normale", "Surface (ha)": priority_surfaces["zone_normale_ha"]},
-            {"Type": "Zone vigilance", "Surface (ha)": priority_surfaces["zone_vigilance_ha"]},
-            {"Type": "Zone prioritaire", "Surface (ha)": priority_surfaces["zone_prioritaire_ha"]},
-        ])
-
-        st.dataframe(df_surfaces.round(2), use_container_width=True)
-
-    # =====================================================
-    # ONGLET 2 - GRAPHIQUES
-    # =====================================================
-    with tab2:
-        st.markdown('<div class="section-title">Graphique des surfaces de végétation</div>', unsafe_allow_html=True)
-
-        df_vigor_graph = pd.DataFrame({
-            "Classe": ["Faible", "Moyenne", "Forte"],
-            "Surface (ha)": [
-                vigor_surfaces["vegetation_faible_ha"],
-                vigor_surfaces["vegetation_moyenne_ha"],
-                vigor_surfaces["vegetation_forte_ha"]
-            ]
-        })
-
-        fig_vigor = px.bar(
-            df_vigor_graph,
-            x="Classe",
-            y="Surface (ha)",
-            title="Répartition des classes de vigueur végétale"
-        )
-        st.plotly_chart(fig_vigor, use_container_width=True)
-
-        st.markdown('<div class="section-title">Graphique des surfaces hydriques</div>', unsafe_allow_html=True)
-
-        df_hydric_graph = pd.DataFrame({
-            "Classe": ["Faible", "Moyen", "Bon"],
-            "Surface (ha)": [
-                hydric_surfaces["hydrique_faible_ha"],
-                hydric_surfaces["hydrique_moyen_ha"],
-                hydric_surfaces["hydrique_bon_ha"]
-            ]
-        })
-
-        fig_hydric = px.bar(
-            df_hydric_graph,
-            x="Classe",
-            y="Surface (ha)",
-            title="Répartition des classes hydriques"
-        )
-        st.plotly_chart(fig_hydric, use_container_width=True)
-
-        st.markdown('<div class="section-title">Graphique des priorités</div>', unsafe_allow_html=True)
-
-        df_priority_graph = pd.DataFrame({
-            "Classe": ["Normale", "Vigilance", "Prioritaire"],
-            "Surface (ha)": [
-                priority_surfaces["zone_normale_ha"],
-                priority_surfaces["zone_vigilance_ha"],
-                priority_surfaces["zone_prioritaire_ha"]
-            ]
-        })
-
-        fig_priority = px.bar(
-            df_priority_graph,
-            x="Classe",
-            y="Surface (ha)",
-            title="Répartition des zones prioritaires"
-        )
-        st.plotly_chart(fig_priority, use_container_width=True)
-
-    # =====================================================
-    # ONGLET 3 - CARTES
-    # =====================================================
-    with tab3:
-        st.markdown('<div class="section-title">Cartes de diagnostic</div>', unsafe_allow_html=True)
         st.markdown(
             """
             <div class="highlight-box">
             <b>Lecture des cartes :</b><br>
-            - NDVI : mesure la vigueur végétale<br>
-            - NDMI : renseigne sur l’état hydrique de la végétation<br>
-            - Carte de priorité : vert = normal, jaune = vigilance, rouge = intervention prioritaire
+            - NDVI : vigueur végétale<br>
+            - NDMI : état hydrique de la végétation<br>
+            - Carte de priorité : vert = normal, jaune = vigilance, rouge = prioritaire
             </div>
             """,
             unsafe_allow_html=True
@@ -468,6 +405,12 @@ try:
 
         m = geemap.Map()
         m.centerObject(region, 14)
+
+        # Fond de carte de base
+        try:
+            m.add_basemap("SATELLITE")
+        except Exception:
+            pass
 
         m.addLayer(
             region.style(**{"color": "blue", "fillColor": "00000000", "width": 2}),
@@ -499,6 +442,108 @@ try:
         m.to_streamlit(height=700)
 
     # =====================================================
+    # ONGLET 2 - STATISTIQUES
+    # =====================================================
+    with tab2:
+        st.markdown('<div class="section-title">Statistiques globales</div>', unsafe_allow_html=True)
+
+        df_stats = pd.DataFrame([
+            {
+                "Indicateur": "NDVI",
+                "Moyenne": ndvi_stats["mean"],
+                "P25": ndvi_stats["p25"],
+                "P75": ndvi_stats["p75"],
+                "Écart-type": ndvi_stats["stdDev"],
+                "Min": ndvi_stats["min"],
+                "Max": ndvi_stats["max"],
+            },
+            {
+                "Indicateur": "NDMI",
+                "Moyenne": ndmi_stats["mean"],
+                "P25": ndmi_stats["p25"],
+                "P75": ndmi_stats["p75"],
+                "Écart-type": ndmi_stats["stdDev"],
+                "Min": ndmi_stats["min"],
+                "Max": ndmi_stats["max"],
+            },
+        ])
+
+        st.dataframe(df_stats.round(3), use_container_width=True)
+
+        st.markdown('<div class="section-title">Surfaces par classe (ha)</div>', unsafe_allow_html=True)
+
+        df_surfaces = pd.DataFrame([
+            {"Type": "Végétation faible", "Surface (ha)": vigor_surfaces["vegetation_faible_ha"]},
+            {"Type": "Végétation moyenne", "Surface (ha)": vigor_surfaces["vegetation_moyenne_ha"]},
+            {"Type": "Végétation forte", "Surface (ha)": vigor_surfaces["vegetation_forte_ha"]},
+            {"Type": "Hydrique faible", "Surface (ha)": hydric_surfaces["hydrique_faible_ha"]},
+            {"Type": "Hydrique moyen", "Surface (ha)": hydric_surfaces["hydrique_moyen_ha"]},
+            {"Type": "Hydrique bon", "Surface (ha)": hydric_surfaces["hydrique_bon_ha"]},
+            {"Type": "Zone normale", "Surface (ha)": priority_surfaces["zone_normale_ha"]},
+            {"Type": "Zone vigilance", "Surface (ha)": priority_surfaces["zone_vigilance_ha"]},
+            {"Type": "Zone prioritaire", "Surface (ha)": priority_surfaces["zone_prioritaire_ha"]},
+        ])
+
+        st.dataframe(df_surfaces.round(2), use_container_width=True)
+
+    # =====================================================
+    # ONGLET 3 - GRAPHIQUES
+    # =====================================================
+    with tab3:
+        st.markdown('<div class="section-title">Graphiques de synthèse</div>', unsafe_allow_html=True)
+
+        df_vigor_graph = pd.DataFrame({
+            "Classe": ["Faible", "Moyenne", "Forte"],
+            "Surface (ha)": [
+                vigor_surfaces["vegetation_faible_ha"],
+                vigor_surfaces["vegetation_moyenne_ha"],
+                vigor_surfaces["vegetation_forte_ha"]
+            ]
+        })
+
+        fig_vigor = px.bar(
+            df_vigor_graph,
+            x="Classe",
+            y="Surface (ha)",
+            title="Répartition des classes de vigueur végétale"
+        )
+        st.plotly_chart(fig_vigor, use_container_width=True)
+
+        df_hydric_graph = pd.DataFrame({
+            "Classe": ["Faible", "Moyen", "Bon"],
+            "Surface (ha)": [
+                hydric_surfaces["hydrique_faible_ha"],
+                hydric_surfaces["hydrique_moyen_ha"],
+                hydric_surfaces["hydrique_bon_ha"]
+            ]
+        })
+
+        fig_hydric = px.bar(
+            df_hydric_graph,
+            x="Classe",
+            y="Surface (ha)",
+            title="Répartition des classes hydriques"
+        )
+        st.plotly_chart(fig_hydric, use_container_width=True)
+
+        df_priority_graph = pd.DataFrame({
+            "Classe": ["Normale", "Vigilance", "Prioritaire"],
+            "Surface (ha)": [
+                priority_surfaces["zone_normale_ha"],
+                priority_surfaces["zone_vigilance_ha"],
+                priority_surfaces["zone_prioritaire_ha"]
+            ]
+        })
+
+        fig_priority = px.bar(
+            df_priority_graph,
+            x="Classe",
+            y="Surface (ha)",
+            title="Répartition des zones prioritaires"
+        )
+        st.plotly_chart(fig_priority, use_container_width=True)
+
+    # =====================================================
     # ONGLET 4 - DIAGNOSTIC
     # =====================================================
     with tab4:
@@ -513,14 +558,12 @@ try:
                 diagnostic_text = (
                     f"La parcelle présente {priority_area:.2f} ha classés comme zones prioritaires. "
                     f"Ces secteurs combinent une faible vigueur végétale et un état hydrique faible ou défavorable. "
-                    f"Une vérification terrain est recommandée, notamment pour contrôler l’irrigation, l’homogénéité "
-                    f"de la parcelle et d’éventuels facteurs limitants."
+                    f"Une vérification terrain est recommandée, notamment pour contrôler l’irrigation et l’homogénéité de la parcelle."
                 )
             elif ndvi_mean < 0.35:
                 diagnostic_text = (
                     "La vigueur végétale moyenne de la parcelle reste relativement faible. "
-                    "Même en l’absence de zone critique marquée, une surveillance est recommandée afin "
-                    "d’identifier d’éventuelles zones de développement insuffisant."
+                    "Une surveillance est recommandée afin d’identifier les secteurs de développement insuffisant."
                 )
             else:
                 diagnostic_text = (
@@ -542,9 +585,9 @@ try:
         st.markdown('<div class="section-title">Interprétation métier</div>', unsafe_allow_html=True)
 
         interpretation_text = (
-            "L’application ne remplace pas l’observation de terrain. "
-            "Elle sert à repérer rapidement les zones où la végétation est plus faible que le reste de la parcelle "
-            "et à vérifier si un état hydrique défavorable peut constituer une piste d’explication."
+            "L’application ne remplace pas la visite de terrain. "
+            "Elle aide à repérer rapidement les zones où la végétation est plus faible que le reste de la parcelle "
+            "et à examiner si un état hydrique défavorable peut constituer une piste d’explication."
         )
 
         st.markdown(
@@ -563,9 +606,10 @@ try:
         st.markdown('<div class="section-title">Export des résultats</div>', unsafe_allow_html=True)
 
         df_export = pd.DataFrame([
+            {"Indicateur": "Date demandée", "Valeur": desired_date.strftime("%Y-%m-%d")},
+            {"Indicateur": "Date image utilisée", "Valeur": closest_date},
             {"Indicateur": "NDVI moyen", "Valeur": ndvi_stats["mean"]},
             {"Indicateur": "NDMI moyen", "Valeur": ndmi_stats["mean"]},
-            {"Indicateur": "Images utilisées", "Valeur": image_count},
             {"Indicateur": "Végétation faible (ha)", "Valeur": vigor_surfaces["vegetation_faible_ha"]},
             {"Indicateur": "Végétation moyenne (ha)", "Valeur": vigor_surfaces["vegetation_moyenne_ha"]},
             {"Indicateur": "Végétation forte (ha)", "Valeur": vigor_surfaces["vegetation_forte_ha"]},

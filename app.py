@@ -7,28 +7,33 @@ import geemap.foliumap as geemap
 from processing import (
     init_ee,
     get_region,
-    get_period_ndvi,
-    get_ndvi_difference,
-    classify_ndvi_difference,
+    build_parcel_from_text,
+    get_monthly_ndvi,
+    get_monthly_ndmi,
+    classify_ndvi_vigor,
+    classify_ndmi_hydric,
+    build_priority_map,
     get_image_stats,
+    get_month_image_count,
+    get_class_surface_stats,
     get_ndvi_vis_params,
-    get_diff_vis_params,
-    get_classified_change_vis_params,
-    get_period_image_count,
-    get_change_surface_stats,
+    get_ndmi_vis_params,
+    get_vigor_vis_params,
+    get_hydric_vis_params,
+    get_priority_vis_params,
 )
 
 # =========================================================
 # CONFIGURATION PAGE
 # =========================================================
 st.set_page_config(
-    page_title="Application NDVI",
+    page_title="Application agricole - Parcelle",
     page_icon="🌿",
     layout="wide",
 )
 
 # =========================================================
-# STYLE CSS PERSONNALISÉ
+# STYLE CSS
 # =========================================================
 st.markdown(
     """
@@ -104,18 +109,18 @@ st.markdown(
 # =========================================================
 # TITRE
 # =========================================================
-st.markdown('<div class="main-title">🌿 Application interactive d’analyse du NDVI</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🌿 Application de diagnostic agricole de parcelle</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">Comparaison de deux périodes pour analyser les changements de la végétation à partir des images Sentinel-2 et de Google Earth Engine.</div>',
+    '<div class="sub-title">Analyse de la vigueur végétale, de l’état hydrique et des zones prioritaires sur une parcelle agricole.</div>',
     unsafe_allow_html=True
 )
 
 st.markdown(
     """
     <div class="zone-box">
-    <b>Zone d’étude :</b> Région Béni Mellal-Khénifra (Maroc).<br>
-    Les images Sentinel-2, les calculs du NDVI et les statistiques affichées dans cette application
-    sont limités à cette emprise spatiale.
+    <b>Objectif :</b> aider l’agriculteur à analyser sa parcelle à distance,
+    repérer les zones à faible végétation, examiner un stress hydrique potentiel
+    et identifier les secteurs prioritaires à surveiller.
     </div>
     """,
     unsafe_allow_html=True
@@ -125,8 +130,9 @@ st.markdown(
 # INITIALISATION GEE
 # =========================================================
 try:
-    init_ee()
-    st.success("Connexion à Google Earth Engine réussie.")
+    ee_ok = init_ee()
+    if not ee_ok:
+        st.stop()
 except Exception as e:
     st.error("Erreur lors de l'initialisation de Google Earth Engine.")
     st.exception(e)
@@ -137,12 +143,17 @@ except Exception as e:
 # =========================================================
 month_dict = {
     "Janvier": 1,
+    "Février": 2,
     "Mars": 3,
     "Avril": 4,
     "Mai": 5,
+    "Juin": 6,
     "Juillet": 7,
+    "Août": 8,
     "Septembre": 9,
-    "Novembre": 11
+    "Octobre": 10,
+    "Novembre": 11,
+    "Décembre": 12
 }
 
 # =========================================================
@@ -150,25 +161,25 @@ month_dict = {
 # =========================================================
 st.sidebar.markdown('<div class="sidebar-title">Paramètres de l’analyse</div>', unsafe_allow_html=True)
 
-year_1 = st.sidebar.selectbox("Année - période 1", [2022, 2023, 2024, 2025], index=0)
-months_1_labels = st.sidebar.multiselect(
-    "Mois - période 1",
-    options=list(month_dict.keys()),
-    default=["Mars", "Avril", "Mai"]
+zone_mode = st.sidebar.radio(
+    "Choix de la zone",
+    ["Utiliser la région par défaut", "Définir ma parcelle par coordonnées"]
 )
 
-year_2 = st.sidebar.selectbox("Année - période 2", [2022, 2023, 2024, 2025], index=2)
-months_2_labels = st.sidebar.multiselect(
-    "Mois - période 2",
-    options=list(month_dict.keys()),
-    default=["Mars", "Avril", "Mai"]
-)
-
+year_selected = st.sidebar.selectbox("Année", [2022, 2023, 2024, 2025], index=3)
+month_label = st.sidebar.selectbox("Mois", list(month_dict.keys()), index=3)
 cloud_threshold = st.sidebar.slider("Seuil maximal de nuages (%)", 0, 50, 15)
 
-st.sidebar.info("Conseil : compare les mêmes mois entre les deux années pour une analyse plus cohérente.")
+parcel_text = ""
+if zone_mode == "Définir ma parcelle par coordonnées":
+    parcel_text = st.sidebar.text_area(
+        "Coordonnées du polygone (latitude,longitude sur chaque ligne)",
+        height=180,
+        placeholder="32.5021,-6.4132\n32.5028,-6.4011\n32.4950,-6.3998\n32.4942,-6.4110"
+    )
+    st.sidebar.caption("Format attendu : une ligne par point, sous la forme latitude,longitude")
 
-run = st.sidebar.button("🚀 Comparer les deux périodes", use_container_width=True)
+run = st.sidebar.button("🚀 Analyser la parcelle", use_container_width=True)
 
 # =========================================================
 # ÉTAT INITIAL
@@ -177,8 +188,11 @@ if not run:
     st.markdown(
         """
         <div class="highlight-box">
-        Cette application permet de comparer deux périodes temporelles sur la région de Béni Mellal-Khénifra
-        afin de mettre en évidence les changements de la végétation à partir du NDVI.
+        Cette application permet à l’utilisateur :
+        <br>• de choisir une parcelle,
+        <br>• de visualiser la vigueur végétale,
+        <br>• d’examiner l’état hydrique,
+        <br>• et d’identifier les zones prioritaires d’intervention.
         </div>
         """,
         unsafe_allow_html=True
@@ -192,8 +206,8 @@ if not run:
         st.markdown(
             """
             <div class="custom-card">
-                <b>1. Choisir les périodes</b><br>
-                Sélectionne une année et un ou plusieurs mois pour chaque période.
+                <b>1. Définir la zone</b><br>
+                Utilise la région par défaut ou saisis les coordonnées de ta parcelle.
             </div>
             """,
             unsafe_allow_html=True
@@ -203,8 +217,8 @@ if not run:
         st.markdown(
             """
             <div class="custom-card">
-                <b>2. Lancer l’analyse</b><br>
-                Clique sur le bouton dans la barre latérale pour exécuter la comparaison.
+                <b>2. Choisir la période</b><br>
+                Sélectionne l’année, le mois et le seuil de nuages.
             </div>
             """,
             unsafe_allow_html=True
@@ -214,8 +228,8 @@ if not run:
         st.markdown(
             """
             <div class="custom-card">
-                <b>3. Lire les résultats</b><br>
-                Consulte les statistiques, le graphique et les cartes comparatives.
+                <b>3. Lire le diagnostic</b><br>
+                Consulte la vigueur végétale, l’état hydrique et les zones prioritaires.
             </div>
             """,
             unsafe_allow_html=True
@@ -224,49 +238,99 @@ if not run:
     st.stop()
 
 # =========================================================
-# TRAITEMENT
+# CONTRÔLE DE SAISIE
 # =========================================================
-if not months_1_labels or not months_2_labels:
-    st.warning("Sélectionne au moins un mois pour chaque période.")
+if zone_mode == "Définir ma parcelle par coordonnées" and not parcel_text.strip():
+    st.warning("Veuillez saisir les coordonnées de la parcelle.")
     st.stop()
 
+# =========================================================
+# TRAITEMENT
+# =========================================================
 try:
-    region = get_region()
+    # -----------------------------------------------------
+    # 1. Définition de la zone d’analyse
+    # -----------------------------------------------------
+    if zone_mode == "Utiliser la région par défaut":
+        region = get_region()
+        zone_label = "Région par défaut"
+    else:
+        region = build_parcel_from_text(parcel_text)
+        zone_label = "Parcelle utilisateur"
 
-    months_1 = [month_dict[m] for m in months_1_labels]
-    months_2 = [month_dict[m] for m in months_2_labels]
+    month_selected = month_dict[month_label]
 
-    ndvi_p1 = get_period_ndvi(year_1, months_1, cloud_threshold)
-    ndvi_p2 = get_period_ndvi(year_2, months_2, cloud_threshold)
-    diff_ndvi = get_ndvi_difference(ndvi_p1, ndvi_p2)
-    classified_change = classify_ndvi_difference(diff_ndvi)
+    # -----------------------------------------------------
+    # 2. Calcul des indices
+    # -----------------------------------------------------
+    ndvi_image = get_monthly_ndvi(year_selected, month_selected, cloud_threshold, region)
+    ndmi_image = get_monthly_ndmi(year_selected, month_selected, cloud_threshold, region)
 
-    stats_p1 = get_image_stats(ndvi_p1, band_name="NDVI")
-    stats_p2 = get_image_stats(ndvi_p2, band_name="NDVI")
-    stats_diff = get_image_stats(diff_ndvi, band_name="NDVI_diff")
+    # -----------------------------------------------------
+    # 3. Classification thématique
+    # -----------------------------------------------------
+    vigor_class = classify_ndvi_vigor(ndvi_image)
+    hydric_class = classify_ndmi_hydric(ndmi_image)
+    priority_map = build_priority_map(vigor_class, hydric_class)
 
-    count_p1 = get_period_image_count(year_1, months_1, cloud_threshold)
-    count_p2 = get_period_image_count(year_2, months_2, cloud_threshold)
+    # -----------------------------------------------------
+    # 4. Statistiques descriptives
+    # -----------------------------------------------------
+    ndvi_stats = get_image_stats(ndvi_image, band_name="NDVI", region=region)
+    ndmi_stats = get_image_stats(ndmi_image, band_name="NDMI", region=region)
 
-    surface_stats = get_change_surface_stats(classified_change)
+    image_count = get_month_image_count(year_selected, month_selected, cloud_threshold, region)
 
-    st.success("Comparaison réalisée avec succès.")
+    vigor_surfaces = get_class_surface_stats(
+        vigor_class,
+        {
+            1: "vegetation_faible_ha",
+            2: "vegetation_moyenne_ha",
+            3: "vegetation_forte_ha"
+        },
+        region=region
+    )
+
+    hydric_surfaces = get_class_surface_stats(
+        hydric_class,
+        {
+            1: "hydrique_faible_ha",
+            2: "hydrique_moyen_ha",
+            3: "hydrique_bon_ha"
+        },
+        region=region
+    )
+
+    priority_surfaces = get_class_surface_stats(
+        priority_map,
+        {
+            1: "zone_normale_ha",
+            2: "zone_vigilance_ha",
+            3: "zone_prioritaire_ha"
+        },
+        region=region
+    )
+
+    st.success("Analyse de la parcelle réalisée avec succès.")
 
     # =====================================================
     # RÉSUMÉ
     # =====================================================
-    st.markdown('<div class="section-title">Résumé de l’analyse</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Résumé du diagnostic</div>', unsafe_allow_html=True)
 
-    r1, r2, r3 = st.columns(3)
+    r1, r2, r3, r4 = st.columns(4)
 
     with r1:
-        st.metric("NDVI moyen période 1", f"{stats_p1['mean']:.3f}" if stats_p1["mean"] is not None else "NA")
+        st.metric("NDVI moyen", f"{ndvi_stats['mean']:.3f}" if ndvi_stats["mean"] is not None else "NA")
 
     with r2:
-        st.metric("NDVI moyen période 2", f"{stats_p2['mean']:.3f}" if stats_p2["mean"] is not None else "NA")
+        st.metric("NDMI moyen", f"{ndmi_stats['mean']:.3f}" if ndmi_stats["mean"] is not None else "NA")
 
     with r3:
-        st.metric("Différence moyenne", f"{stats_diff['mean']:.3f}" if stats_diff["mean"] is not None else "NA")
+        st.metric("Images utilisées", image_count)
+
+    with r4:
+        st.metric("Zone prioritaire (ha)", f"{priority_surfaces['zone_prioritaire_ha']:.2f}")
 
     # =====================================================
     # ONGLETS
@@ -275,7 +339,7 @@ try:
         "📊 Statistiques",
         "📈 Graphiques",
         "🗺️ Cartes",
-        "🧠 Analyse & interprétation",
+        "🧠 Diagnostic",
         "⬇️ Export"
     ])
 
@@ -283,161 +347,151 @@ try:
     # ONGLET 1 - STATISTIQUES
     # =====================================================
     with tab1:
-        st.markdown('<div class="section-title">Nombre d’images utilisées</div>', unsafe_allow_html=True)
-
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.metric("Images période 1", count_p1)
-        with cc2:
-            st.metric("Images période 2", count_p2)
-
-        st.markdown('<div class="section-title">Tableau comparatif des statistiques</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Statistiques globales</div>', unsafe_allow_html=True)
 
         df_stats = pd.DataFrame([
             {
-                "Période": f"Période 1 ({year_1})",
-                "Mois": ", ".join(months_1_labels),
-                "Moyenne": stats_p1["mean"],
-                "P25": stats_p1["p25"],
-                "P75": stats_p1["p75"],
-                "Écart-type": stats_p1["stdDev"],
+                "Indicateur": "NDVI",
+                "Moyenne": ndvi_stats["mean"],
+                "P25": ndvi_stats["p25"],
+                "P75": ndvi_stats["p75"],
+                "Écart-type": ndvi_stats["stdDev"],
+                "Min": ndvi_stats["min"],
+                "Max": ndvi_stats["max"],
             },
             {
-                "Période": f"Période 2 ({year_2})",
-                "Mois": ", ".join(months_2_labels),
-                "Moyenne": stats_p2["mean"],
-                "P25": stats_p2["p25"],
-                "P75": stats_p2["p75"],
-                "Écart-type": stats_p2["stdDev"],
-            },
-            {
-                "Période": "Différence",
-                "Mois": "-",
-                "Moyenne": stats_diff["mean"],
-                "P25": stats_diff["p25"],
-                "P75": stats_diff["p75"],
-                "Écart-type": stats_diff["stdDev"],
+                "Indicateur": "NDMI",
+                "Moyenne": ndmi_stats["mean"],
+                "P25": ndmi_stats["p25"],
+                "P75": ndmi_stats["p75"],
+                "Écart-type": ndmi_stats["stdDev"],
+                "Min": ndmi_stats["min"],
+                "Max": ndmi_stats["max"],
             },
         ])
 
         st.dataframe(df_stats.round(3), use_container_width=True)
 
-        st.markdown('<div class="section-title">Surfaces de changement (hectares)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Surfaces par classe (hectares)</div>', unsafe_allow_html=True)
 
-        s1, s2, s3 = st.columns(3)
-        with s1:
-            st.metric("Surface en diminution (ha)", f"{surface_stats['diminution_ha']:.2f}")
-        with s2:
-            st.metric("Surface stable (ha)", f"{surface_stats['stable_ha']:.2f}")
-        with s3:
-            st.metric("Surface en augmentation (ha)", f"{surface_stats['augmentation_ha']:.2f}")
+        df_surfaces = pd.DataFrame([
+            {"Type": "Végétation faible", "Surface (ha)": vigor_surfaces["vegetation_faible_ha"]},
+            {"Type": "Végétation moyenne", "Surface (ha)": vigor_surfaces["vegetation_moyenne_ha"]},
+            {"Type": "Végétation forte", "Surface (ha)": vigor_surfaces["vegetation_forte_ha"]},
+            {"Type": "Hydrique faible", "Surface (ha)": hydric_surfaces["hydrique_faible_ha"]},
+            {"Type": "Hydrique moyen", "Surface (ha)": hydric_surfaces["hydrique_moyen_ha"]},
+            {"Type": "Hydrique bon", "Surface (ha)": hydric_surfaces["hydrique_bon_ha"]},
+            {"Type": "Zone normale", "Surface (ha)": priority_surfaces["zone_normale_ha"]},
+            {"Type": "Zone vigilance", "Surface (ha)": priority_surfaces["zone_vigilance_ha"]},
+            {"Type": "Zone prioritaire", "Surface (ha)": priority_surfaces["zone_prioritaire_ha"]},
+        ])
+
+        st.dataframe(df_surfaces.round(2), use_container_width=True)
 
     # =====================================================
     # ONGLET 2 - GRAPHIQUES
     # =====================================================
     with tab2:
-        st.markdown('<div class="section-title">Graphique comparatif du NDVI</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Graphique des surfaces de végétation</div>', unsafe_allow_html=True)
 
-        indicators = ["Moyenne", "P25", "P75", "Écart-type"]
-        values_p1 = [stats_p1["mean"], stats_p1["p25"], stats_p1["p75"], stats_p1["stdDev"]]
-        values_p2 = [stats_p2["mean"], stats_p2["p25"], stats_p2["p75"], stats_p2["stdDev"]]
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Bar(
-                name=f"Période 1 ({year_1})",
-                x=indicators,
-                y=values_p1,
-                text=[f"{v:.3f}" if v is not None else "NA" for v in values_p1],
-                textposition="outside",
-            )
-        )
-
-        fig.add_trace(
-            go.Bar(
-                name=f"Période 2 ({year_2})",
-                x=indicators,
-                y=values_p2,
-                text=[f"{v:.3f}" if v is not None else "NA" for v in values_p2],
-                textposition="outside",
-            )
-        )
-
-        fig.update_layout(
-            title="Comparaison des statistiques robustes du NDVI entre les deux périodes",
-            xaxis_title="Indicateurs",
-            yaxis_title="Valeur",
-            barmode="group",
-            legend_title="Périodes",
-            height=520,
-            margin=dict(l=40, r=40, t=70, b=40),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown('<div class="section-title">Graphique des surfaces de changement</div>', unsafe_allow_html=True)
-
-        df_surface = pd.DataFrame({
-            "Classe": ["Diminution", "Stable", "Augmentation"],
+        df_vigor_graph = pd.DataFrame({
+            "Classe": ["Faible", "Moyenne", "Forte"],
             "Surface (ha)": [
-                surface_stats["diminution_ha"],
-                surface_stats["stable_ha"],
-                surface_stats["augmentation_ha"],
+                vigor_surfaces["vegetation_faible_ha"],
+                vigor_surfaces["vegetation_moyenne_ha"],
+                vigor_surfaces["vegetation_forte_ha"]
             ]
         })
 
-        fig_surface = px.bar(
-            df_surface,
+        fig_vigor = px.bar(
+            df_vigor_graph,
             x="Classe",
             y="Surface (ha)",
-            title="Répartition des surfaces selon le type de changement"
+            title="Répartition des classes de vigueur végétale"
         )
+        st.plotly_chart(fig_vigor, use_container_width=True)
 
-        st.plotly_chart(fig_surface, use_container_width=True)
+        st.markdown('<div class="section-title">Graphique des surfaces hydriques</div>', unsafe_allow_html=True)
+
+        df_hydric_graph = pd.DataFrame({
+            "Classe": ["Faible", "Moyen", "Bon"],
+            "Surface (ha)": [
+                hydric_surfaces["hydrique_faible_ha"],
+                hydric_surfaces["hydrique_moyen_ha"],
+                hydric_surfaces["hydrique_bon_ha"]
+            ]
+        })
+
+        fig_hydric = px.bar(
+            df_hydric_graph,
+            x="Classe",
+            y="Surface (ha)",
+            title="Répartition des classes hydriques"
+        )
+        st.plotly_chart(fig_hydric, use_container_width=True)
+
+        st.markdown('<div class="section-title">Graphique des priorités</div>', unsafe_allow_html=True)
+
+        df_priority_graph = pd.DataFrame({
+            "Classe": ["Normale", "Vigilance", "Prioritaire"],
+            "Surface (ha)": [
+                priority_surfaces["zone_normale_ha"],
+                priority_surfaces["zone_vigilance_ha"],
+                priority_surfaces["zone_prioritaire_ha"]
+            ]
+        })
+
+        fig_priority = px.bar(
+            df_priority_graph,
+            x="Classe",
+            y="Surface (ha)",
+            title="Répartition des zones prioritaires"
+        )
+        st.plotly_chart(fig_priority, use_container_width=True)
 
     # =====================================================
     # ONGLET 3 - CARTES
     # =====================================================
     with tab3:
-        st.markdown('<div class="section-title">Cartes comparatives</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Cartes de diagnostic</div>', unsafe_allow_html=True)
         st.markdown(
             """
             <div class="highlight-box">
             <b>Lecture des cartes :</b><br>
-            - Carte NDVI : les valeurs plus élevées traduisent une végétation plus vigoureuse.<br>
-            - Carte de différence : le vert indique une augmentation, le rouge une diminution.<br>
-            - Carte classée : rouge = diminution, gris = stabilité, vert = augmentation.
+            - NDVI : mesure la vigueur végétale<br>
+            - NDMI : renseigne sur l’état hydrique de la végétation<br>
+            - Carte de priorité : vert = normal, jaune = vigilance, rouge = intervention prioritaire
             </div>
             """,
             unsafe_allow_html=True
         )
 
         m = geemap.Map()
-        m.centerObject(region, 8)
+        m.centerObject(region, 14)
 
         m.addLayer(
             region.style(**{"color": "blue", "fillColor": "00000000", "width": 2}),
             {},
-            "Région"
+            zone_label
         )
 
-        m.addLayer(ndvi_p1, get_ndvi_vis_params(), f"NDVI période 1 ({year_1})")
-        m.addLayer(ndvi_p2, get_ndvi_vis_params(), f"NDVI période 2 ({year_2})")
-        m.addLayer(diff_ndvi, get_diff_vis_params(), "Différence NDVI")
-        m.addLayer(classified_change, get_classified_change_vis_params(), "Changement classé")
+        m.addLayer(ndvi_image, get_ndvi_vis_params(), "NDVI")
+        m.addLayer(ndmi_image, get_ndmi_vis_params(), "NDMI")
+        m.addLayer(vigor_class, get_vigor_vis_params(), "Classes de vigueur")
+        m.addLayer(hydric_class, get_hydric_vis_params(), "Classes hydriques")
+        m.addLayer(priority_map, get_priority_vis_params(), "Carte de priorité")
 
         m.add_colorbar(
             vis_params=get_ndvi_vis_params(),
             label="NDVI",
-            layer_name=f"NDVI période 1 ({year_1})",
+            layer_name="NDVI",
             position="bottomleft"
         )
 
         m.add_colorbar(
-            vis_params=get_diff_vis_params(),
-            label="Différence NDVI",
-            layer_name="Différence NDVI",
+            vis_params=get_ndmi_vis_params(),
+            label="NDMI",
+            layer_name="NDMI",
             position="bottomright"
         )
 
@@ -445,60 +499,58 @@ try:
         m.to_streamlit(height=700)
 
     # =====================================================
-    # ONGLET 4 - ANALYSE & INTERPRÉTATION
+    # ONGLET 4 - DIAGNOSTIC
     # =====================================================
     with tab4:
-        st.markdown('<div class="section-title">Analyse des résultats</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Diagnostic agronomique simplifié</div>', unsafe_allow_html=True)
 
-        analyse_text = (
-            f"Le NDVI moyen de la période 1 ({year_1}) est de {stats_p1['mean']:.3f}, "
-            f"contre {stats_p2['mean']:.3f} pour la période 2 ({year_2}). "
-            f"Les percentiles P25 et P75 décrivent la distribution des valeurs de NDVI "
-            f"et permettent une lecture plus robuste que les seules valeurs minimales et maximales. "
-            f"L’écart-type est de {stats_p1['stdDev']:.3f} pour la période 1 et de {stats_p2['stdDev']:.3f} "
-            f"pour la période 2. "
-            f"Les surfaces calculées montrent {surface_stats['diminution_ha']:.2f} ha en diminution, "
-            f"{surface_stats['stable_ha']:.2f} ha stables et {surface_stats['augmentation_ha']:.2f} ha en augmentation."
-        )
+        ndvi_mean = ndvi_stats["mean"]
+        ndmi_mean = ndmi_stats["mean"]
+        priority_area = priority_surfaces["zone_prioritaire_ha"]
+
+        if ndvi_mean is not None and ndmi_mean is not None:
+            if priority_area > 0:
+                diagnostic_text = (
+                    f"La parcelle présente {priority_area:.2f} ha classés comme zones prioritaires. "
+                    f"Ces secteurs combinent une faible vigueur végétale et un état hydrique faible ou défavorable. "
+                    f"Une vérification terrain est recommandée, notamment pour contrôler l’irrigation, l’homogénéité "
+                    f"de la parcelle et d’éventuels facteurs limitants."
+                )
+            elif ndvi_mean < 0.35:
+                diagnostic_text = (
+                    "La vigueur végétale moyenne de la parcelle reste relativement faible. "
+                    "Même en l’absence de zone critique marquée, une surveillance est recommandée afin "
+                    "d’identifier d’éventuelles zones de développement insuffisant."
+                )
+            else:
+                diagnostic_text = (
+                    "La parcelle présente globalement un état végétatif satisfaisant. "
+                    "Aucune zone critique majeure n’a été identifiée à partir des seuils retenus."
+                )
+        else:
+            diagnostic_text = "Le diagnostic automatique n’a pas pu être généré."
 
         st.markdown(
             f"""
             <div class="highlight-box">
-            {analyse_text}
+            {diagnostic_text}
             </div>
             """,
             unsafe_allow_html=True
         )
 
-        st.markdown('<div class="section-title">Interprétation des résultats</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Interprétation métier</div>', unsafe_allow_html=True)
 
-        diff_mean = stats_diff["mean"]
-        if diff_mean is not None:
-            if diff_mean > 0.02:
-                interpretation = (
-                    "La comparaison suggère une amélioration globale de la vigueur de la végétation entre les deux périodes. "
-                    "Cette évolution peut être liée à de meilleures conditions hydriques, à une dynamique culturale plus favorable "
-                    "ou à une couverture végétale plus dense."
-                )
-            elif diff_mean < -0.02:
-                interpretation = (
-                    "La comparaison suggère une diminution globale de la vigueur de la végétation entre les deux périodes. "
-                    "Cette baisse peut refléter un stress hydrique, une variabilité climatique, des changements d’occupation du sol "
-                    "ou des pratiques agricoles différentes."
-                )
-            else:
-                interpretation = (
-                    "La comparaison suggère une relative stabilité globale de la végétation entre les deux périodes. "
-                    "Les variations observées semblent limitées et peuvent correspondre à une dynamique saisonnière normale "
-                    "ou à des changements de faible intensité."
-                )
-        else:
-            interpretation = "Aucune interprétation automatique n’a pu être générée."
+        interpretation_text = (
+            "L’application ne remplace pas l’observation de terrain. "
+            "Elle sert à repérer rapidement les zones où la végétation est plus faible que le reste de la parcelle "
+            "et à vérifier si un état hydrique défavorable peut constituer une piste d’explication."
+        )
 
         st.markdown(
             f"""
             <div class="highlight-box">
-            {interpretation}
+            {interpretation_text}
             </div>
             """,
             unsafe_allow_html=True
@@ -508,75 +560,33 @@ try:
     # ONGLET 5 - EXPORT
     # =====================================================
     with tab5:
-        st.markdown('<div class="section-title">Export des statistiques</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Export des résultats</div>', unsafe_allow_html=True)
 
         df_export = pd.DataFrame([
-            {
-                "Période": f"Période 1 ({year_1})",
-                "Mois": ", ".join(months_1_labels),
-                "Moyenne": stats_p1["mean"],
-                "P25": stats_p1["p25"],
-                "P75": stats_p1["p75"],
-                "Écart-type": stats_p1["stdDev"],
-                "Images": count_p1,
-            },
-            {
-                "Période": f"Période 2 ({year_2})",
-                "Mois": ", ".join(months_2_labels),
-                "Moyenne": stats_p2["mean"],
-                "P25": stats_p2["p25"],
-                "P75": stats_p2["p75"],
-                "Écart-type": stats_p2["stdDev"],
-                "Images": count_p2,
-            },
-            {
-                "Période": "Différence",
-                "Mois": "-",
-                "Moyenne": stats_diff["mean"],
-                "P25": stats_diff["p25"],
-                "P75": stats_diff["p75"],
-                "Écart-type": stats_diff["stdDev"],
-                "Images": "-",
-            },
-            {
-                "Période": "Surface diminution",
-                "Mois": "-",
-                "Moyenne": surface_stats["diminution_ha"],
-                "P25": None,
-                "P75": None,
-                "Écart-type": None,
-                "Images": "-",
-            },
-            {
-                "Période": "Surface stable",
-                "Mois": "-",
-                "Moyenne": surface_stats["stable_ha"],
-                "P25": None,
-                "P75": None,
-                "Écart-type": None,
-                "Images": "-",
-            },
-            {
-                "Période": "Surface augmentation",
-                "Mois": "-",
-                "Moyenne": surface_stats["augmentation_ha"],
-                "P25": None,
-                "P75": None,
-                "Écart-type": None,
-                "Images": "-",
-            },
+            {"Indicateur": "NDVI moyen", "Valeur": ndvi_stats["mean"]},
+            {"Indicateur": "NDMI moyen", "Valeur": ndmi_stats["mean"]},
+            {"Indicateur": "Images utilisées", "Valeur": image_count},
+            {"Indicateur": "Végétation faible (ha)", "Valeur": vigor_surfaces["vegetation_faible_ha"]},
+            {"Indicateur": "Végétation moyenne (ha)", "Valeur": vigor_surfaces["vegetation_moyenne_ha"]},
+            {"Indicateur": "Végétation forte (ha)", "Valeur": vigor_surfaces["vegetation_forte_ha"]},
+            {"Indicateur": "Hydrique faible (ha)", "Valeur": hydric_surfaces["hydrique_faible_ha"]},
+            {"Indicateur": "Hydrique moyen (ha)", "Valeur": hydric_surfaces["hydrique_moyen_ha"]},
+            {"Indicateur": "Hydrique bon (ha)", "Valeur": hydric_surfaces["hydrique_bon_ha"]},
+            {"Indicateur": "Zone normale (ha)", "Valeur": priority_surfaces["zone_normale_ha"]},
+            {"Indicateur": "Zone vigilance (ha)", "Valeur": priority_surfaces["zone_vigilance_ha"]},
+            {"Indicateur": "Zone prioritaire (ha)", "Valeur": priority_surfaces["zone_prioritaire_ha"]},
         ])
 
         st.dataframe(df_export, use_container_width=True)
 
         csv = df_export.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="📥 Télécharger les statistiques en CSV",
+            label="📥 Télécharger les résultats en CSV",
             data=csv,
-            file_name="statistiques_ndvi_comparaison.csv",
+            file_name="diagnostic_parcelle_agricole.csv",
             mime="text/csv"
         )
 
 except Exception as e:
-    st.error("Erreur lors de la comparaison des périodes.")
+    st.error("Erreur lors de l’analyse de la parcelle.")
     st.exception(e)

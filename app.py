@@ -2,15 +2,17 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import geemap.foliumap as geemap
-from datetime import date, timedelta
+import folium
+from folium.plugins import Draw, Fullscreen
+from streamlit_folium import st_folium
 
 from processing import (
     init_ee,
     get_region,
     build_parcel_from_text,
-    get_available_dates,
-    find_closest_date,
-    get_image_for_exact_date,
+    build_parcel_from_geojson,
+    get_available_dates_for_month,
+    get_image_for_date,
     get_ndvi,
     get_ndmi,
     classify_ndvi_vigor,
@@ -113,14 +115,16 @@ st.markdown(
 # =========================================================
 st.markdown('<div class="main-title">🌿 Application de suivi agricole de parcelle</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">Analyse de la vigueur végétale, de l’état hydrique et des zones prioritaires sur une parcelle agricole à partir de l’image disponible la plus proche.</div>',
+    '<div class="sub-title">Dessiner une parcelle, choisir un mois, sélectionner une date disponible, puis analyser la vigueur végétale, l’état hydrique et les zones prioritaires.</div>',
     unsafe_allow_html=True
 )
 
 st.markdown(
     """
     <div class="zone-box">
-    <b>Objectif :</b> aider l’agriculteur à suivre sa parcelle à distance, à partir de l’image Sentinel-2 disponible la plus proche de la date souhaitée, afin d’évaluer l’état de la végétation, l’état hydrique et les zones à surveiller.
+    <b>Objectif :</b> aider l’agriculteur à localiser sa parcelle sur une carte,
+    dessiner ou saisir sa zone d’intérêt, puis analyser l’image Sentinel-2 disponible
+    sur la date réellement accessible.
     </div>
     """,
     unsafe_allow_html=True
@@ -139,175 +143,240 @@ except Exception as e:
     st.stop()
 
 # =========================================================
+# ÉTAT DE SESSION
+# =========================================================
+if "parcel_geojson" not in st.session_state:
+    st.session_state["parcel_geojson"] = None
+
+# =========================================================
 # SIDEBAR
 # =========================================================
 st.sidebar.markdown('<div class="sidebar-title">Paramètres de l’analyse</div>', unsafe_allow_html=True)
 
 zone_mode = st.sidebar.radio(
-    "Choix de la zone",
-    ["Utiliser la région par défaut", "Définir ma parcelle par coordonnées"]
+    "Mode de sélection de la parcelle",
+    ["Dessiner sur la carte", "Saisir les coordonnées"]
 )
 
+cloud_threshold = st.sidebar.slider("Seuil maximal de nuages (%)", 0, 80, 20)
+
+year_selected = st.sidebar.selectbox("Année", [2022, 2023, 2024, 2025, 2026], index=4)
+month_dict = {
+    "Janvier": 1,
+    "Février": 2,
+    "Mars": 3,
+    "Avril": 4,
+    "Mai": 5,
+    "Juin": 6,
+    "Juillet": 7,
+    "Août": 8,
+    "Septembre": 9,
+    "Octobre": 10,
+    "Novembre": 11,
+    "Décembre": 12
+}
+month_label = st.sidebar.selectbox("Mois", list(month_dict.keys()), index=2)
+month_selected = month_dict[month_label]
+
 parcel_text = ""
-if zone_mode == "Définir ma parcelle par coordonnées":
+if zone_mode == "Saisir les coordonnées":
     parcel_text = st.sidebar.text_area(
         "Coordonnées de la parcelle (latitude,longitude sur chaque ligne)",
         height=180,
         placeholder="32.5021,-6.4132\n32.5028,-6.4011\n32.4950,-6.3998\n32.4942,-6.4110"
     )
-    st.sidebar.caption("Format : une ligne par point, sous la forme latitude,longitude")
+    st.sidebar.caption("Format attendu : une ligne par point, sous la forme latitude,longitude")
 
-cloud_threshold = st.sidebar.slider("Seuil maximal de nuages (%)", 0, 80, 20)
-
-# Date demandée par l'utilisateur
-desired_date = st.sidebar.date_input(
-    "Date souhaitée",
-    value=date.today() - timedelta(days=10)
-)
-
-# Fenêtre de recherche des dates disponibles
-days_back = st.sidebar.slider(
-    "Nombre de jours récents à explorer",
-    min_value=15,
-    max_value=180,
-    value=90,
-    step=5
-)
-
-run = st.sidebar.button("🚀 Analyser la parcelle", use_container_width=True)
+analyze_clicked = st.sidebar.button("🚀 Analyser la parcelle", use_container_width=True)
 
 # =========================================================
-# ÉTAT INITIAL
+# PARTIE 1 : CARTE DE LOCALISATION / DESSIN
 # =========================================================
-if not run:
+st.markdown('<div class="section-title">1. Localisation de la parcelle</div>', unsafe_allow_html=True)
+
+left_col, right_col = st.columns([2.2, 1])
+
+with left_col:
+    # Centre initial sur le Maroc
+    m = folium.Map(location=[31.8, -7.1], zoom_start=6, tiles=None)
+
+    # Fonds de carte
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True).add_to(m)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+        name="Satellite",
+        overlay=False,
+        control=True
+    ).add_to(m)
+
+    # Si une parcelle existe déjà, on la réaffiche
+    if st.session_state["parcel_geojson"] is not None:
+        folium.GeoJson(
+            st.session_state["parcel_geojson"],
+            name="Parcelle enregistrée",
+            style_function=lambda x: {
+                "color": "blue",
+                "weight": 3,
+                "fillOpacity": 0.1
+            }
+        ).add_to(m)
+
+    # Outil de dessin : uniquement polygones
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "rectangle": False,
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
+            "polygon": True
+        },
+        edit_options={
+            "edit": True,
+            "remove": True
+        }
+    ).add_to(m)
+
+    Fullscreen().add_to(m)
+    folium.LayerControl().add_to(m)
+
+    map_data = st_folium(
+        m,
+        width=None,
+        height=600,
+        returned_objects=["all_drawings", "last_active_drawing"]
+    )
+
+with right_col:
     st.markdown(
         """
-        <div class="highlight-box">
-        Cette application permet à l’utilisateur :
-        <br>• de choisir sa parcelle,
-        <br>• de demander une date d’analyse,
-        <br>• d’utiliser automatiquement l’image disponible la plus proche,
-        <br>• puis d’obtenir un diagnostic agricole simplifié.
+        <div class="custom-card">
+        <b>Utilisation de la carte</b><br><br>
+        • Choisis un fond OSM ou Satellite<br>
+        • Zoome sur ta zone au Maroc<br>
+        • Dessine un polygone sur ta parcelle<br>
+        • Ou utilise la saisie des coordonnées dans la barre latérale
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    st.markdown('<div class="section-title">Mode d’utilisation</div>', unsafe_allow_html=True)
+    if zone_mode == "Dessiner sur la carte":
+        if map_data and map_data.get("all_drawings"):
+            last_polygon = None
+            for feature in map_data["all_drawings"]:
+                geom = feature.get("geometry", {})
+                if geom.get("type") == "Polygon":
+                    last_polygon = feature
 
-    c1, c2, c3 = st.columns(3)
+            if last_polygon is not None:
+                st.session_state["parcel_geojson"] = last_polygon
+                st.success("Parcelle dessinée détectée.")
+            else:
+                st.info("Dessine un polygone pour définir la parcelle.")
+        else:
+            st.info("Dessine un polygone sur la carte.")
 
-    with c1:
-        st.markdown(
-            """
-            <div class="custom-card">
-                <b>1. Définir la parcelle</b><br>
-                Utilise la région par défaut ou saisis les coordonnées de ta parcelle.
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+# =========================================================
+# CONSTRUCTION DE LA PARCELLE
+# =========================================================
+parcel_region = None
 
-    with c2:
-        st.markdown(
-            """
-            <div class="custom-card">
-                <b>2. Choisir une date</b><br>
-                L’application recherche automatiquement l’image disponible la plus proche.
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+try:
+    if zone_mode == "Dessiner sur la carte":
+        if st.session_state["parcel_geojson"] is not None:
+            parcel_region = build_parcel_from_geojson(st.session_state["parcel_geojson"])
+    else:
+        if parcel_text.strip():
+            parcel_region = build_parcel_from_text(parcel_text)
+except Exception as e:
+    st.warning(f"Problème dans la définition de la parcelle : {e}")
 
-    with c3:
-        st.markdown(
-            """
-            <div class="custom-card">
-                <b>3. Lire le diagnostic</b><br>
-                Consulte les cartes, les statistiques et les zones prioritaires d’intervention.
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
+# =========================================================
+# ARRÊT SI PARCELLE NON DISPONIBLE
+# =========================================================
+if parcel_region is None:
+    st.warning("Veuillez dessiner votre parcelle sur la carte ou saisir ses coordonnées.")
     st.stop()
 
 # =========================================================
-# CONTRÔLE DE SAISIE
+# PARTIE 2 : DATES DISPONIBLES
 # =========================================================
-if zone_mode == "Définir ma parcelle par coordonnées" and not parcel_text.strip():
-    st.warning("Veuillez saisir les coordonnées de la parcelle.")
+st.markdown('<div class="section-title">2. Dates d’images disponibles</div>', unsafe_allow_html=True)
+
+try:
+    available_dates = get_available_dates_for_month(
+        region=parcel_region,
+        year=year_selected,
+        month=month_selected,
+        cloud_threshold=cloud_threshold
+    )
+except Exception as e:
+    st.error("Erreur lors de la récupération des dates disponibles.")
+    st.exception(e)
     st.stop()
 
+if not available_dates:
+    st.warning("Aucune image disponible pour cette parcelle sur le mois choisi.")
+    st.stop()
+
+st.markdown(
+    f"""
+    <div class="highlight-box">
+    <b>Mois choisi :</b> {month_label} {year_selected}<br>
+    <b>Nombre de dates disponibles :</b> {len(available_dates)}<br>
+    Pour rester en Python/Streamlit, l’application propose directement les dates réellement disponibles au lieu d’un calendrier coloré.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+formatted_dates = {
+    d: pd.to_datetime(d).strftime("%d/%m/%Y") for d in available_dates
+}
+
+selected_date = st.selectbox(
+    "Choisis une date disponible",
+    available_dates,
+    format_func=lambda x: formatted_dates[x]
+)
+
 # =========================================================
-# TRAITEMENT
+# ANALYSE
 # =========================================================
+if not analyze_clicked:
+    st.stop()
+
 try:
     # -----------------------------------------------------
-    # 1. Définition de la zone d’analyse
+    # 1. Chargement de l'image
     # -----------------------------------------------------
-    if zone_mode == "Utiliser la région par défaut":
-        region = get_region()
-        zone_label = "Région par défaut"
-    else:
-        region = build_parcel_from_text(parcel_text)
-        zone_label = "Parcelle utilisateur"
-
-    # -----------------------------------------------------
-    # 2. Recherche des dates disponibles sur les derniers jours
-    # -----------------------------------------------------
-    desired_date_str = desired_date.strftime("%Y-%m-%d")
-    start_search_date = (desired_date - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    end_search_date = date.today().strftime("%Y-%m-%d")
-
-    available_dates = get_available_dates(
-        region=region,
-        start_date=start_search_date,
-        end_date=end_search_date,
+    image = get_image_for_date(
+        region=parcel_region,
+        selected_date=selected_date,
         cloud_threshold=cloud_threshold
     )
 
-    if not available_dates:
-        st.warning("Aucune image disponible pour cette parcelle sur la période récente choisie.")
-        st.stop()
-
-    closest_date = find_closest_date(desired_date_str, available_dates)
-
-    if closest_date is None:
-        st.warning("Impossible de trouver une date proche.")
-        st.stop()
-
     # -----------------------------------------------------
-    # 3. Chargement de l'image du jour retenu
-    # -----------------------------------------------------
-    image = get_image_for_exact_date(
-        region=region,
-        selected_date=closest_date,
-        cloud_threshold=cloud_threshold
-    )
-
-    if image is None:
-        st.warning("Impossible de charger l’image retenue.")
-        st.stop()
-
-    # -----------------------------------------------------
-    # 4. Calcul des indices
+    # 2. Calcul des indices
     # -----------------------------------------------------
     ndvi_image = get_ndvi(image)
     ndmi_image = get_ndmi(image)
 
     # -----------------------------------------------------
-    # 5. Classification
+    # 3. Classes
     # -----------------------------------------------------
     vigor_class = classify_ndvi_vigor(ndvi_image)
     hydric_class = classify_ndmi_hydric(ndmi_image)
     priority_map = build_priority_map(vigor_class, hydric_class)
 
     # -----------------------------------------------------
-    # 6. Statistiques
+    # 4. Statistiques
     # -----------------------------------------------------
-    ndvi_stats = get_image_stats(ndvi_image, band_name="NDVI", region=region)
-    ndmi_stats = get_image_stats(ndmi_image, band_name="NDMI", region=region)
+    ndvi_stats = get_image_stats(ndvi_image, band_name="NDVI", region=parcel_region)
+    ndmi_stats = get_image_stats(ndmi_image, band_name="NDMI", region=parcel_region)
 
     vigor_surfaces = get_class_surface_stats(
         vigor_class,
@@ -316,7 +385,7 @@ try:
             2: "vegetation_moyenne_ha",
             3: "vegetation_forte_ha"
         },
-        region=region
+        region=parcel_region
     )
 
     hydric_surfaces = get_class_surface_stats(
@@ -326,7 +395,7 @@ try:
             2: "hydrique_moyen_ha",
             3: "hydrique_bon_ha"
         },
-        region=region
+        region=parcel_region
     )
 
     priority_surfaces = get_class_surface_stats(
@@ -336,7 +405,7 @@ try:
             2: "zone_vigilance_ha",
             3: "zone_prioritaire_ha"
         },
-        region=region
+        region=parcel_region
     )
 
     st.success("Analyse réalisée avec succès.")
@@ -344,45 +413,30 @@ try:
     # =====================================================
     # RÉSUMÉ RAPIDE
     # =====================================================
-    st.markdown('<div class="section-title">Résumé rapide</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">3. Résumé rapide</div>', unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        st.metric("Date demandée", desired_date.strftime("%d/%m/%Y"))
+        st.metric("Date image utilisée", pd.to_datetime(selected_date).strftime("%d/%m/%Y"))
 
     with c2:
-        st.metric("Image utilisée", datetime.strptime(closest_date, "%Y-%m-%d").strftime("%d/%m/%Y"))
+        st.metric("NDVI moyen", f"{ndvi_stats['mean']:.3f}" if ndvi_stats["mean"] is not None else "NA")
 
     with c3:
-        st.metric("NDVI moyen", f"{ndvi_stats['mean']:.3f}" if ndvi_stats["mean"] is not None else "NA")
+        st.metric("NDMI moyen", f"{ndmi_stats['mean']:.3f}" if ndmi_stats["mean"] is not None else "NA")
 
     with c4:
         st.metric("Zone prioritaire (ha)", f"{priority_surfaces['zone_prioritaire_ha']:.2f}")
 
     # =====================================================
-    # DATES DISPONIBLES
-    # =====================================================
-    st.markdown('<div class="section-title">Dates disponibles récentes</div>', unsafe_allow_html=True)
-
-    df_dates = pd.DataFrame({"Dates disponibles": available_dates})
-    df_dates["Date formatée"] = pd.to_datetime(df_dates["Dates disponibles"]).dt.strftime("%d/%m/%Y")
-    df_dates["Utilisée"] = df_dates["Dates disponibles"].apply(lambda x: "Oui" if x == closest_date else "")
-
-    st.dataframe(
-        df_dates[["Date formatée", "Utilisée"]],
-        use_container_width=True
-    )
-
-    # =====================================================
     # ONGLETS
     # =====================================================
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "🗺️ Cartes",
         "📊 Statistiques",
         "📈 Graphiques",
-        "🧠 Diagnostic",
-        "⬇️ Export"
+        "🧠 Diagnostic"
     ])
 
     # =====================================================
@@ -391,55 +445,37 @@ try:
     with tab1:
         st.markdown('<div class="section-title">Cartes principales</div>', unsafe_allow_html=True)
 
-        st.markdown(
-            """
-            <div class="highlight-box">
-            <b>Lecture des cartes :</b><br>
-            - NDVI : vigueur végétale<br>
-            - NDMI : état hydrique de la végétation<br>
-            - Carte de priorité : vert = normal, jaune = vigilance, rouge = prioritaire
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        gm = geemap.Map()
+        gm.centerObject(parcel_region, 15)
 
-        m = geemap.Map()
-        m.centerObject(region, 14)
-
-        # Fond de carte de base
-        try:
-            m.add_basemap("SATELLITE")
-        except Exception:
-            pass
-
-        m.addLayer(
-            region.style(**{"color": "blue", "fillColor": "00000000", "width": 2}),
+        gm.addLayer(
+            parcel_region.style(**{"color": "blue", "fillColor": "00000000", "width": 2}),
             {},
-            zone_label
+            "Parcelle"
         )
 
-        m.addLayer(ndvi_image, get_ndvi_vis_params(), "NDVI")
-        m.addLayer(ndmi_image, get_ndmi_vis_params(), "NDMI")
-        m.addLayer(vigor_class, get_vigor_vis_params(), "Classes de vigueur")
-        m.addLayer(hydric_class, get_hydric_vis_params(), "Classes hydriques")
-        m.addLayer(priority_map, get_priority_vis_params(), "Carte de priorité")
+        gm.addLayer(ndvi_image, get_ndvi_vis_params(), "NDVI")
+        gm.addLayer(ndmi_image, get_ndmi_vis_params(), "NDMI")
+        gm.addLayer(vigor_class, get_vigor_vis_params(), "Classes de vigueur")
+        gm.addLayer(hydric_class, get_hydric_vis_params(), "Classes hydriques")
+        gm.addLayer(priority_map, get_priority_vis_params(), "Carte de priorité")
 
-        m.add_colorbar(
+        gm.add_colorbar(
             vis_params=get_ndvi_vis_params(),
             label="NDVI",
             layer_name="NDVI",
             position="bottomleft"
         )
 
-        m.add_colorbar(
+        gm.add_colorbar(
             vis_params=get_ndmi_vis_params(),
             label="NDMI",
             layer_name="NDMI",
             position="bottomright"
         )
 
-        m.addLayerControl()
-        m.to_streamlit(height=700)
+        gm.addLayerControl()
+        gm.to_streamlit(height=700)
 
     # =====================================================
     # ONGLET 2 - STATISTIQUES
@@ -490,9 +526,7 @@ try:
     # ONGLET 3 - GRAPHIQUES
     # =====================================================
     with tab3:
-        st.markdown('<div class="section-title">Graphiques de synthèse</div>', unsafe_allow_html=True)
-
-        df_vigor_graph = pd.DataFrame({
+        df_vigor = pd.DataFrame({
             "Classe": ["Faible", "Moyenne", "Forte"],
             "Surface (ha)": [
                 vigor_surfaces["vegetation_faible_ha"],
@@ -500,16 +534,12 @@ try:
                 vigor_surfaces["vegetation_forte_ha"]
             ]
         })
-
-        fig_vigor = px.bar(
-            df_vigor_graph,
-            x="Classe",
-            y="Surface (ha)",
-            title="Répartition des classes de vigueur végétale"
+        st.plotly_chart(
+            px.bar(df_vigor, x="Classe", y="Surface (ha)", title="Répartition des classes de vigueur végétale"),
+            use_container_width=True
         )
-        st.plotly_chart(fig_vigor, use_container_width=True)
 
-        df_hydric_graph = pd.DataFrame({
+        df_hydric = pd.DataFrame({
             "Classe": ["Faible", "Moyen", "Bon"],
             "Surface (ha)": [
                 hydric_surfaces["hydrique_faible_ha"],
@@ -517,16 +547,12 @@ try:
                 hydric_surfaces["hydrique_bon_ha"]
             ]
         })
-
-        fig_hydric = px.bar(
-            df_hydric_graph,
-            x="Classe",
-            y="Surface (ha)",
-            title="Répartition des classes hydriques"
+        st.plotly_chart(
+            px.bar(df_hydric, x="Classe", y="Surface (ha)", title="Répartition des classes hydriques"),
+            use_container_width=True
         )
-        st.plotly_chart(fig_hydric, use_container_width=True)
 
-        df_priority_graph = pd.DataFrame({
+        df_priority = pd.DataFrame({
             "Classe": ["Normale", "Vigilance", "Prioritaire"],
             "Surface (ha)": [
                 priority_surfaces["zone_normale_ha"],
@@ -534,44 +560,33 @@ try:
                 priority_surfaces["zone_prioritaire_ha"]
             ]
         })
-
-        fig_priority = px.bar(
-            df_priority_graph,
-            x="Classe",
-            y="Surface (ha)",
-            title="Répartition des zones prioritaires"
+        st.plotly_chart(
+            px.bar(df_priority, x="Classe", y="Surface (ha)", title="Répartition des zones prioritaires"),
+            use_container_width=True
         )
-        st.plotly_chart(fig_priority, use_container_width=True)
 
     # =====================================================
     # ONGLET 4 - DIAGNOSTIC
     # =====================================================
     with tab4:
-        st.markdown('<div class="section-title">Diagnostic agronomique simplifié</div>', unsafe_allow_html=True)
-
-        ndvi_mean = ndvi_stats["mean"]
-        ndmi_mean = ndmi_stats["mean"]
         priority_area = priority_surfaces["zone_prioritaire_ha"]
 
-        if ndvi_mean is not None and ndmi_mean is not None:
-            if priority_area > 0:
-                diagnostic_text = (
-                    f"La parcelle présente {priority_area:.2f} ha classés comme zones prioritaires. "
-                    f"Ces secteurs combinent une faible vigueur végétale et un état hydrique faible ou défavorable. "
-                    f"Une vérification terrain est recommandée, notamment pour contrôler l’irrigation et l’homogénéité de la parcelle."
-                )
-            elif ndvi_mean < 0.35:
-                diagnostic_text = (
-                    "La vigueur végétale moyenne de la parcelle reste relativement faible. "
-                    "Une surveillance est recommandée afin d’identifier les secteurs de développement insuffisant."
-                )
-            else:
-                diagnostic_text = (
-                    "La parcelle présente globalement un état végétatif satisfaisant. "
-                    "Aucune zone critique majeure n’a été identifiée à partir des seuils retenus."
-                )
+        if priority_area > 0:
+            diagnostic_text = (
+                f"La parcelle présente {priority_area:.2f} ha classés comme zones prioritaires. "
+                f"Ces secteurs combinent une faible vigueur végétale et un état hydrique défavorable. "
+                f"Une vérification terrain est recommandée, notamment pour contrôler l’irrigation."
+            )
+        elif ndvi_stats["mean"] is not None and ndvi_stats["mean"] < 0.35:
+            diagnostic_text = (
+                "La vigueur végétale moyenne de la parcelle reste relativement faible. "
+                "Une surveillance est recommandée pour identifier les secteurs les moins performants."
+            )
         else:
-            diagnostic_text = "Le diagnostic automatique n’a pas pu être généré."
+            diagnostic_text = (
+                "La parcelle présente globalement un état satisfaisant. "
+                "Aucune zone critique majeure n’a été détectée avec les seuils retenus."
+            )
 
         st.markdown(
             f"""
@@ -580,55 +595,6 @@ try:
             </div>
             """,
             unsafe_allow_html=True
-        )
-
-        st.markdown('<div class="section-title">Interprétation métier</div>', unsafe_allow_html=True)
-
-        interpretation_text = (
-            "L’application ne remplace pas la visite de terrain. "
-            "Elle aide à repérer rapidement les zones où la végétation est plus faible que le reste de la parcelle "
-            "et à examiner si un état hydrique défavorable peut constituer une piste d’explication."
-        )
-
-        st.markdown(
-            f"""
-            <div class="highlight-box">
-            {interpretation_text}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    # =====================================================
-    # ONGLET 5 - EXPORT
-    # =====================================================
-    with tab5:
-        st.markdown('<div class="section-title">Export des résultats</div>', unsafe_allow_html=True)
-
-        df_export = pd.DataFrame([
-            {"Indicateur": "Date demandée", "Valeur": desired_date.strftime("%Y-%m-%d")},
-            {"Indicateur": "Date image utilisée", "Valeur": closest_date},
-            {"Indicateur": "NDVI moyen", "Valeur": ndvi_stats["mean"]},
-            {"Indicateur": "NDMI moyen", "Valeur": ndmi_stats["mean"]},
-            {"Indicateur": "Végétation faible (ha)", "Valeur": vigor_surfaces["vegetation_faible_ha"]},
-            {"Indicateur": "Végétation moyenne (ha)", "Valeur": vigor_surfaces["vegetation_moyenne_ha"]},
-            {"Indicateur": "Végétation forte (ha)", "Valeur": vigor_surfaces["vegetation_forte_ha"]},
-            {"Indicateur": "Hydrique faible (ha)", "Valeur": hydric_surfaces["hydrique_faible_ha"]},
-            {"Indicateur": "Hydrique moyen (ha)", "Valeur": hydric_surfaces["hydrique_moyen_ha"]},
-            {"Indicateur": "Hydrique bon (ha)", "Valeur": hydric_surfaces["hydrique_bon_ha"]},
-            {"Indicateur": "Zone normale (ha)", "Valeur": priority_surfaces["zone_normale_ha"]},
-            {"Indicateur": "Zone vigilance (ha)", "Valeur": priority_surfaces["zone_vigilance_ha"]},
-            {"Indicateur": "Zone prioritaire (ha)", "Valeur": priority_surfaces["zone_prioritaire_ha"]},
-        ])
-
-        st.dataframe(df_export, use_container_width=True)
-
-        csv = df_export.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Télécharger les résultats en CSV",
-            data=csv,
-            file_name="diagnostic_parcelle_agricole.csv",
-            mime="text/csv"
         )
 
 except Exception as e:

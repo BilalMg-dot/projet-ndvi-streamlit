@@ -1,13 +1,19 @@
 import ee
 import streamlit as st
 import os
+from datetime import datetime, timedelta
+
 
 # =========================================================
-# CONSTANTES
+# CONSTANTES GLOBALES
 # =========================================================
-# On garde les constantes liées au projet et à la collection Sentinel-2.
+# Identifiant du projet Google Cloud / Earth Engine
 PROJECT_ID = "rising-method-478510-v9"
+
+# Région par défaut (peut servir de zone de départ ou de secours)
 ASSET_REGION = "projects/rising-method-478510-v9/assets/GEE_OT_Region"
+
+# Collection Sentinel-2 harmonisée
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
 
 # Seuils simples pour classer la vigueur végétale (NDVI)
@@ -70,20 +76,20 @@ def init_ee():
 # =========================================================
 def get_region():
     """
-    Retourne la région d'étude par défaut depuis les assets GEE.
+    Retourne la région d'étude par défaut.
     """
     return ee.FeatureCollection(ASSET_REGION)
 
 
 # =========================================================
-# CONSTRUCTION D'UNE PARCELLE À PARTIR DE COORDONNÉES
+# CONSTRUCTION D'UNE PARCELLE À PARTIR D'UN TEXTE
 # =========================================================
 def build_parcel_from_text(coord_text: str):
     """
-    Construit une parcelle (polygone) à partir d'un texte saisi par l'utilisateur.
+    Construit une parcelle (polygone) à partir d'un texte saisi.
 
     Format attendu :
-    une ligne par point avec :
+    une ligne par point sous la forme :
     latitude,longitude
 
     Exemple :
@@ -92,7 +98,7 @@ def build_parcel_from_text(coord_text: str):
     32.4950,-6.3998
     32.4942,-6.4110
 
-    Attention :
+    Remarque :
     - l'utilisateur saisit latitude,longitude
     - Earth Engine attend longitude,latitude
     """
@@ -134,49 +140,46 @@ def build_parcel_from_text(coord_text: str):
 def mask_s2_clouds(image):
     """
     Supprime certains pixels non souhaités à partir de la bande SCL.
+
+    Classes retirées :
+    - 3  : ombre de nuage
+    - 8  : nuage moyen
+    - 9  : nuage fort
+    - 10 : cirrus
+    - 11 : neige / glace
     """
     scl = image.select("SCL")
     mask = (
-        scl.neq(3)    # ombre de nuage
-        .And(scl.neq(8))   # nuage moyen
-        .And(scl.neq(9))   # nuage fort
-        .And(scl.neq(10))  # cirrus
-        .And(scl.neq(11))  # neige / glace
+        scl.neq(3)
+        .And(scl.neq(8))
+        .And(scl.neq(9))
+        .And(scl.neq(10))
+        .And(scl.neq(11))
     )
     return image.updateMask(mask)
 
 
 # =========================================================
-# DÉBUT ET FIN D'UN MOIS
+# DATES
 # =========================================================
-def get_month_start_end(year: int, month: int):
+def to_ee_date(date_str: str):
     """
-    Retourne la date de début et de fin d'un mois.
+    Convertit une date texte YYYY-MM-DD en date Earth Engine.
     """
-    start = ee.Date.fromYMD(year, month, 1)
-    end = start.advance(1, "month")
-    return start, end
+    return ee.Date(date_str)
 
 
-# =========================================================
-# COLLECTION SENTINEL-2 SUR UNE PARCELLE
-# =========================================================
-def get_monthly_collection(year: int, month: int, cloud_threshold: int = 15, region=None):
+def get_image_collection(region, start_date: str, end_date: str, cloud_threshold: int = 20):
     """
     Retourne la collection Sentinel-2 filtrée :
-    - sur une zone donnée
-    - sur un mois donné
-    - selon un seuil de nuages
+    - sur la parcelle étudiée
+    - sur l'intervalle de dates demandé
+    - sur un seuil maximal de nuages
     """
-    if region is None:
-        region = get_region()
-
-    start, end = get_month_start_end(year, month)
-
     collection = (
         ee.ImageCollection(S2_COLLECTION)
         .filterBounds(region)
-        .filterDate(start, end)
+        .filterDate(start_date, end_date)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_threshold))
         .map(mask_s2_clouds)
     )
@@ -184,76 +187,100 @@ def get_monthly_collection(year: int, month: int, cloud_threshold: int = 15, reg
 
 
 # =========================================================
-# NOMBRE D'IMAGES UTILISÉES
+# DATES DISPONIBLES
 # =========================================================
-def get_month_image_count(year: int, month: int, cloud_threshold: int = 15, region=None):
+def get_available_dates(region, start_date: str, end_date: str, cloud_threshold: int = 20):
     """
-    Retourne le nombre d'images Sentinel-2 retenues.
+    Retourne la liste des dates disponibles (YYYY-MM-DD)
+    pour la parcelle et l'intervalle choisis.
+
+    Cette fonction est utile pour :
+    - montrer à l'utilisateur les dates réellement disponibles
+    - trouver l'image la plus proche de la date souhaitée
     """
-    collection = get_monthly_collection(year, month, cloud_threshold, region)
-    return collection.size().getInfo()
+    collection = get_image_collection(region, start_date, end_date, cloud_threshold)
+
+    timestamps = collection.aggregate_array("system:time_start").getInfo() or []
+
+    # Conversion en dates texte
+    date_strings = []
+    for ts in timestamps:
+        date_str = datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+        date_strings.append(date_str)
+
+    # On retire les doublons puis on trie
+    date_strings = sorted(list(set(date_strings)))
+    return date_strings
+
+
+def find_closest_date(target_date: str, available_dates: list[str]):
+    """
+    Cherche la date disponible la plus proche de la date demandée.
+    """
+    if not available_dates:
+        return None
+
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+
+    closest = min(
+        available_dates,
+        key=lambda d: abs(datetime.strptime(d, "%Y-%m-%d") - target_dt)
+    )
+    return closest
 
 
 # =========================================================
-# IMAGE MÉDIANE D'UN MOIS
+# IMAGE UTILISÉE
 # =========================================================
-def get_monthly_composite(year: int, month: int, cloud_threshold: int = 15, region=None):
+def get_image_for_exact_date(region, selected_date: str, cloud_threshold: int = 20):
     """
-    Construit l'image médiane d'un mois sur la parcelle étudiée.
+    Retourne l'image Sentinel-2 d'une date exacte (jour précis).
+
+    S'il y a plusieurs images le même jour, on garde la meilleure
+    selon le plus faible pourcentage de nuages.
     """
-    if region is None:
-        region = get_region()
+    start = selected_date
+    end = (datetime.strptime(selected_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    collection = get_monthly_collection(year, month, cloud_threshold, region)
-    image = collection.median().clip(region)
+    collection = (
+        get_image_collection(region, start, end, cloud_threshold)
+        .sort("CLOUDY_PIXEL_PERCENTAGE")
+    )
 
-    start, _ = get_month_start_end(year, month)
+    image = collection.first()
+    if image is None:
+        return None
 
-    return image.set({
-        "year": year,
-        "month": month,
-        "system:time_start": start.millis(),
-        "image_count": collection.size()
-    })
+    return ee.Image(image).clip(region)
 
 
 # =========================================================
-# CALCUL NDVI
+# CALCUL DES INDICES
 # =========================================================
-def get_monthly_ndvi(year: int, month: int, cloud_threshold: int = 15, region=None):
+def get_ndvi(image):
     """
-    Calcule le NDVI sur la parcelle étudiée.
-
+    Calcule le NDVI :
     NDVI = (B8 - B4) / (B8 + B4)
     """
-    image = get_monthly_composite(year, month, cloud_threshold, region)
-    ndvi = image.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    return ndvi
+    return image.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
 
-# =========================================================
-# CALCUL NDMI (INDICE HYDRIQUE)
-# =========================================================
-def get_monthly_ndmi(year: int, month: int, cloud_threshold: int = 15, region=None):
+def get_ndmi(image):
     """
-    Calcule le NDMI sur la parcelle étudiée.
-
+    Calcule le NDMI :
     NDMI = (B8 - B11) / (B8 + B11)
 
     Cet indice donne une indication sur l'état hydrique de la végétation.
     """
-    image = get_monthly_composite(year, month, cloud_threshold, region)
-    ndmi = image.normalizedDifference(["B8", "B11"]).rename("NDMI")
-    return ndmi
+    return image.normalizedDifference(["B8", "B11"]).rename("NDMI")
 
 
 # =========================================================
-# CLASSIFICATION DE LA VIGUEUR VÉGÉTALE
+# CLASSIFICATIONS
 # =========================================================
 def classify_ndvi_vigor(ndvi_image):
     """
     Classe le NDVI en 3 classes :
-
     1 = végétation faible
     2 = végétation moyenne
     3 = végétation forte
@@ -268,13 +295,9 @@ def classify_ndvi_vigor(ndvi_image):
     return classified
 
 
-# =========================================================
-# CLASSIFICATION DE L'ÉTAT HYDRIQUE
-# =========================================================
 def classify_ndmi_hydric(ndmi_image):
     """
     Classe le NDMI en 3 classes :
-
     1 = état hydrique faible / stress potentiel
     2 = état hydrique moyen
     3 = état hydrique satisfaisant
@@ -289,20 +312,17 @@ def classify_ndmi_hydric(ndmi_image):
     return classified
 
 
-# =========================================================
-# CARTE DE PRIORITÉ D'INTERVENTION
-# =========================================================
 def build_priority_map(vigor_class, hydric_class):
     """
     Construit une carte de priorité d'intervention.
 
-    Règles simples :
+    Règles :
     - 1 = zone normale
     - 2 = zone à surveiller
-    - 3 = zone prioritaire (faible végétation + faible état hydrique)
+    - 3 = zone prioritaire
 
     Logique :
-    - si vigueur faible ET état hydrique faible => priorité forte
+    - faible vigueur + faible état hydrique => priorité forte
     - si un seul des deux est faible => vigilance
     - sinon => zone normale
     """
@@ -318,17 +338,17 @@ def build_priority_map(vigor_class, hydric_class):
 
 
 # =========================================================
-# STATISTIQUES D'UNE IMAGE
+# STATISTIQUES D'IMAGE
 # =========================================================
 def get_image_stats(image, band_name="NDVI", region=None):
     """
-    Calcule des statistiques descriptives sur une image :
+    Calcule les statistiques principales :
     - moyenne
     - écart-type
-    - P25
-    - P75
-    - min
-    - max
+    - percentile 25
+    - percentile 75
+    - minimum
+    - maximum
     """
     if region is None:
         region = get_region()
@@ -360,16 +380,18 @@ def get_image_stats(image, band_name="NDVI", region=None):
 
 
 # =========================================================
-# SURFACES PAR CLASSE
+# SURFACES PAR CLASSES
 # =========================================================
 def get_class_surface_stats(classified_image, class_dict, region=None):
     """
-    Calcule la surface (en hectares) de chaque classe d'une image classée.
+    Calcule la surface (ha) de chaque classe.
 
-    Paramètres :
-    - classified_image : image classée
-    - class_dict : dictionnaire du type {1: "faible", 2: "moyen", 3: "fort"}
-    - region : parcelle à analyser
+    Exemple de class_dict :
+    {
+        1: "faible",
+        2: "moyen",
+        3: "fort"
+    }
     """
     if region is None:
         region = get_region()
@@ -394,7 +416,7 @@ def get_class_surface_stats(classified_image, class_dict, region=None):
 
 
 # =========================================================
-# PARAMÈTRES D'AFFICHAGE DES CARTES
+# PARAMÈTRES D'AFFICHAGE
 # =========================================================
 def get_ndvi_vis_params():
     """
@@ -442,7 +464,7 @@ def get_hydric_vis_params():
 
 def get_priority_vis_params():
     """
-    Paramètres d'affichage de la carte de priorité d'intervention.
+    Paramètres d'affichage des zones prioritaires.
     """
     return {
         "min": 1,
